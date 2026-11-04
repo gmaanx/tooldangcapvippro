@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>KahootHybridEngine</title>
+  <script type="module" crossorigin src="/popup/index.js"></script>
+  <link rel="modulepreload" crossorigin href="/chunks/modulepreload-polyfill-B5Qt9EMX.js">
+  <link rel="modulepreload" crossorigin href="/chunks/constants-r9eDtArV.js">
+  <link rel="modulepreload" crossorigin href="/chunks/storage-CzjHr1q0.js">
+  <link rel="stylesheet" crossorigin href="/assets/index-DfyI-n4z.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="bolt-badge" aria-hidden="true">⚡</span>
+      <div>
+        <h1>KahootHybridEngine</h1>
+        <p class="subtitle">Multi-AI Consensus &amp; Stealth Score Control</p>
+      </div>
+    </div>
+    <label class="master-toggle" for="engine-enabled">
+      <input type="checkbox" id="engine-enabled" name="enabled" class="visually-hidden-fallback" checked>
+      <span>Active</span>
+    </label>
+  </header>
+
+  <main>
+    <section class="telemetry-bar" aria-label="Live Engine Telemetry">
+      <div class="metric">
+        <span class="metric-label">Tier</span>
+        <strong id="telemetry-tier">Idle</strong>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Latency</span>
+        <strong id="telemetry-latency">—</strong>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Bank</span>
+        <strong id="telemetry-cache">0 Qs</strong>
+      </div>
+    </section>
+
+    <form id="settings-form" action="#" method="post" novalidate>
+      <fieldset class="panel">
+        <legend>1. Execution &amp; Point Pacing</legend>
+        <p class="live-ready-note">Keep Chrome's top debugging bar open on <code>kahoot.it</code> so real hardware Auto-Click works.</p>
+        <div class="radio-group">
+          <label class="radio-option" for="mode-instant">
+            <input type="radio" id="mode-instant" name="triggerMode" value="instant_auto_click" checked>
+            <span>
+              <strong>Instant Auto-Click (+1000 pts)</strong>
+              <small>Clicks immediately at max speed (&lt;0.5s)</small>
+            </span>
+          </label>
+          <label class="radio-option" for="mode-target-score">
+            <input type="radio" id="mode-target-score" name="triggerMode" value="target_score">
+            <span>
+              <strong>Target Score Auto-Click (Stealth Points)</strong>
+              <small>Slows down click to hit your custom score (&plusmn;25 natural variance)</small>
+            </span>
+          </label>
+          <label class="radio-option" for="mode-jitter">
+            <input type="radio" id="mode-jitter" name="triggerMode" value="smart_human_jitter">
+            <span>
+              <strong>Custom Delay (ms)</strong>
+              <small>Randomized delay between Min &amp; Max milliseconds</small>
+            </span>
+          </label>
+          <label class="radio-option" for="mode-highlight">
+            <input type="radio" id="mode-highlight" name="triggerMode" value="highlight_only">
+            <span>
+              <strong>Highlight Only</strong>
+              <small>Draws gold border only (manual click)</small>
+            </span>
+          </label>
+        </div>
+
+        <div id="target-score-row" class="score-control-box" hidden>
+          <div class="label-row">
+            <label for="target-score">Desired Points / Question</label>
+            <output id="target-score-output" for="target-score" class="score-pill">~860 pts (&plusmn;25)</output>
+          </div>
+          <input
+            type="range"
+            id="target-score"
+            name="targetScore"
+            min="600"
+            max="1000"
+            step="10"
+            value="860"
+            aria-describedby="target-score-hint"
+          >
+          <span id="target-score-hint" class="hint">Auto-scales with each question timer (~5.6s click on a 20s question)</span>
+          <div class="preset-pills" role="group" aria-label="Target score presets">
+            <button type="button" class="preset-pill" data-score="930">~930 Top</button>
+            <button type="button" class="preset-pill" data-score="860">~860 Natural</button>
+            <button type="button" class="preset-pill" data-score="760">~760 Safe</button>
+            <button type="button" class="preset-pill" data-score="660">~660 Chill</button>
+          </div>
+        </div>
+
+        <div id="jitter-bounds-row" class="two-col" hidden>
+          <div class="field">
+            <label for="min-delay-ms">Min Delay (ms)</label>
+            <span id="min-delay-hint" class="hint">Default: 1100</span>
+            <input
+              type="text"
+              id="min-delay-ms"
+              name="minDelayMs"
+              inputmode="numeric"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+              required
+              pattern="\d{1,5}"
+              value="1100"
+              aria-describedby="min-delay-hint"
+              aria-errormessage="min-delay-error"
+            >
+            <div id="min-delay-error" class="error-msg">
+              <span aria-hidden="true">⚠</span> Enter 0–99999 ms.
+            </div>
+          </div>
+          <div class="field">
+            <label for="max-delay-ms">Max Delay (ms)</label>
+            <span id="max-delay-hint" class="hint">Default: 2100</span>
+            <input
+              type="text"
+              id="max-delay-ms"
+              name="maxDelayMs"
+              inputmode="numeric"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+              required
+              pattern="\d{1,5}"
+              value="2100"
+              aria-describedby="max-delay-hint"
+              aria-errormessage="max-delay-error"
+            >
+            <div id="max-delay-error" class="error-msg">
+              <span aria-hidden="true">⚠</span> Must be &ge; Min Delay.
+            </div>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset class="panel">
+        <legend>2. Multi-AI Ensemble &amp; API Keys</legend>
+        <label class="checkbox-card" for="consensus-mode">
+          <input type="checkbox" id="consensus-mode" name="consensusMode" class="visually-hidden-fallback" checked>
+          <span>
+            <strong>Multi-AI Consensus Vote (Anti-Error)</strong>
+            <small>Races multiple AI APIs &amp; distinct models in parallel, locking in when 2+ agree</small>
+          </span>
+        </label>
+
+        <div class="field">
+          <div class="label-row">
+            <label for="groq-api-key">Groq API Key (~150ms LPU Ensemble)</label>
+            <button
+              type="button"
+              id="toggle-groq-key"
+              class="unmask-btn"
+              aria-pressed="false"
+              aria-label="Show Groq API key"
+            >Show</button>
+          </div>
+          <span id="groq-key-hint" class="hint">Free at console.groq.com (Llama 4 Maverick + Scout + Qwen3.8)</span>
+          <input
+            type="password"
+            id="groq-api-key"
+            name="groqApiKey"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            aria-describedby="groq-key-hint"
+          >
+        </div>
+
+        <div class="field">
+          <div class="label-row">
+            <label for="gemini-api-key">Gemini API Key (gemini-3.8-flash)</label>
+            <button
+              type="button"
+              id="toggle-gemini-key"
+              class="unmask-btn"
+              aria-pressed="false"
+              aria-label="Show Gemini API key"
+            >Show</button>
+          </div>
+          <span id="gemini-key-hint" class="hint">Personal @gmail.com key from aistudio.google.com (Text + Vision)</span>
+          <input
+            type="password"
+            id="gemini-api-key"
+            name="geminiApiKey"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            aria-describedby="gemini-key-hint"
+          >
+        </div>
+
+        <div class="field">
+          <div class="label-row">
+            <label for="openrouter-api-key">OpenRouter API Key (Free Multi-Model)</label>
+            <button
+              type="button"
+              id="toggle-openrouter-key"
+              class="unmask-btn"
+              aria-pressed="false"
+              aria-label="Show OpenRouter API key"
+            >Show</button>
+          </div>
+          <span id="openrouter-key-hint" class="hint">Free key from openrouter.ai/keys (DeepSeek V3 / Qwen3 :free)</span>
+          <input
+            type="password"
+            id="openrouter-api-key"
+            name="openRouterApiKey"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            aria-describedby="openrouter-key-hint"
+          >
+        </div>
+
+        <div class="field">
+          <div class="label-row">
+            <label for="mistral-api-key">Mistral AI API Key (Text + Pixtral Vision)</label>
+            <button
+              type="button"
+              id="toggle-mistral-key"
+              class="unmask-btn"
+              aria-pressed="false"
+              aria-label="Show Mistral API key"
+            >Show</button>
+          </div>
+          <span id="mistral-key-hint" class="hint">Free Experiment key from console.mistral.ai (mistral-small + pixtral)</span>
+          <input
+            type="password"
+            id="mistral-api-key"
+            name="mistralApiKey"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            aria-describedby="mistral-key-hint"
+          >
+        </div>
+      </fieldset>
+
+      <div class="footer-actions">
+        <button type="submit" id="save-settings-btn" class="primary-btn">Save Configuration</button>
+        <div class="vision-actions">
+          <button type="button" id="vision-now-btn" class="secondary-btn">Tab Vision (Alt+Shift+Q)</button>
+          <button type="button" id="clipboard-now-btn" class="secondary-btn">Clipboard (Alt+Shift+V)</button>
+        </div>
+      </div>
+
+      <p id="form-status" class="status-banner" role="status" aria-live="polite"></p>
+
+      <details class="panel collapsible-panel">
+        <summary>Optional: Lecture Notes, Challenge Cache &amp; Quick Join PIN</summary>
+        <div class="collapsible-body">
+          <div class="field">
+            <label for="pinned-context">Lecture Notes / Slide Keywords</label>
+            <span id="context-hint" class="hint">Optional context injected into AI prompt for course-specific questions</span>
+            <textarea
+              id="pinned-context"
+              name="pinnedContext"
+              rows="2"
+              aria-describedby="context-hint"
+            ></textarea>
+          </div>
+
+          <div class="field">
+            <label for="quiz-id">Challenge Link, Quiz UUID, or Quick-Join Live PIN</label>
+            <span id="quiz-id-hint" class="hint">Classroom Live PINs have no UUID (AI solves in-game). Paste a Challenge URL/UUID to pre-cache 0ms answers, or enter a Live PIN to open kahoot.it directly.</span>
+            <input
+              type="text"
+              id="quiz-id"
+              name="quizId"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+              aria-describedby="quiz-id-hint"
+            >
+          </div>
+
+          <div class="inline-actions">
+            <button type="button" id="prefetch-cache-btn" class="secondary-btn">Join PIN / Cache Challenge</button>
+            <button type="button" id="clear-cache-btn" class="ghost-btn">Clear Cache</button>
+          </div>
+          <p id="cache-detail" class="micro-status" aria-live="polite">No quiz cached in memory.</p>
+        </div>
+      </details>
+    </form>
+  </main>
+
+</body>
+</html>

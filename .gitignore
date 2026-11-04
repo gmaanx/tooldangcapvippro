@@ -1,0 +1,15 @@
+node_modules/
+AGENT_LOG.md
+AGENTS.md
+CLAUDE.md
+CHROMEWEBSTORE.md
+.gemini/
+.agent/
+.claude/
+.vscode/
+.idea/
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db

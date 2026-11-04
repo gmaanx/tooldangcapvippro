@@ -1,0 +1,82 @@
+{
+  "manifest_version": 3,
+  "name": "KahootHybridEngine",
+  "version": "1.0.0",
+  "description": "Real-time 4-tier hybrid quiz detection and low-latency answer resolution engine for Kahoot.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_popup": "popup/index.html",
+    "default_title": "KahootHybridEngine",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "scripting",
+    "debugger",
+    "webRequest",
+    "clipboardRead",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://kahoot.it/*",
+    "https://play.kahoot.it/*",
+    "https://create.kahoot.it/*",
+    "https://api.groq.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://openrouter.ai/*",
+    "https://api.mistral.ai/*",
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://kahoot.it/*",
+        "https://play.kahoot.it/*",
+        "https://create.kahoot.it/*"
+      ],
+      "js": ["content/injector.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://kahoot.it/*",
+        "https://play.kahoot.it/*",
+        "https://create.kahoot.it/*"
+      ],
+      "js": ["content/content.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "ISOLATED"
+    }
+  ],
+  "commands": {
+    "trigger-vision-fallback": {
+      "suggested_key": {
+        "default": "Alt+Shift+Q"
+      },
+      "description": "Capture visible tab and resolve Kahoot answer via Gemini Vision"
+    },
+    "trigger-clipboard-vision": {
+      "suggested_key": {
+        "default": "Alt+Shift+V"
+      },
+      "description": "Read snipped screenshot or text from Clipboard and solve Kahoot answer"
+    }
+  }
+}
