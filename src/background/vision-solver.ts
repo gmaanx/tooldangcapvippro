@@ -18,7 +18,6 @@ import {
   isProviderKeyMuted,
   recordProviderAuthFailure,
   runGroqVisionCompletionWithFallback,
-  runMistralVisionCompletionWithFallback,
 } from './ai-racer';
 
 export interface VisionResolutionResult {
@@ -169,11 +168,10 @@ export async function resolveViaVisionCapture(
 ): Promise<VisionResolutionResult> {
   const hasGemini = settings.geminiApiKey.length > 0;
   const hasGroq = settings.groqApiKey.length > 0;
-  const hasMistral = settings.mistralApiKey.length > 0;
 
-  if (!hasGemini && !hasGroq && !hasMistral) {
+  if (!hasGemini && !hasGroq) {
     throw new Error(
-      'Configure Groq, Gemini, or Mistral API key in Popup for Vision Fallback.'
+      'Configure Groq or Gemini API key in Popup for Vision Fallback.'
     );
   }
 
@@ -185,11 +183,9 @@ export async function resolveViaVisionCapture(
   const startedAt = performance.now();
   const geminiAbort = new AbortController();
   const groqAbort = new AbortController();
-  const mistralAbort = new AbortController();
   const timeoutHandle = setTimeout(() => {
     geminiAbort.abort();
     groqAbort.abort();
-    mistralAbort.abort();
   }, INFERENCE_TIMEOUT_MS + 1800);
 
   try {
@@ -244,18 +240,12 @@ export async function resolveViaVisionCapture(
     const groqMuted = hasGroq
       ? isProviderKeyMuted('groq', settings.groqApiKey)
       : null;
-    const mistralMuted = hasMistral
-      ? isProviderKeyMuted('mistral', settings.mistralApiKey)
-      : null;
 
     const anyUnmuted =
-      (hasGemini && !geminiMuted) ||
-      (hasGroq && !groqMuted) ||
-      (hasMistral && !mistralMuted);
+      (hasGemini && !geminiMuted) || (hasGroq && !groqMuted);
 
     const runGemini = hasGemini && (!anyUnmuted || !geminiMuted);
     const runGroq = hasGroq && (!anyUnmuted || !groqMuted);
-    const runMistral = hasMistral && (!anyUnmuted || !mistralMuted);
 
     const tasks: Array<Promise<{ indices: number[]; hostOnlyBlank?: boolean }>> =
       [];
@@ -290,21 +280,6 @@ export async function resolveViaVisionCapture(
       );
     }
 
-    if (runMistral) {
-      tasks.push(
-        runMistralVisionCompletionWithFallback(
-          systemInstruction,
-          visionPrompt,
-          compressed.base64,
-          compressed.mimeType,
-          safeOptionCount,
-          multiSelect,
-          settings.mistralApiKey,
-          mistralAbort.signal
-        )
-      );
-    }
-
     try {
       const winner = await Promise.any(tasks);
       return {
@@ -325,7 +300,6 @@ export async function resolveViaVisionCapture(
     clearTimeout(timeoutHandle);
     geminiAbort.abort();
     groqAbort.abort();
-    mistralAbort.abort();
     await releaseVisionCaptureLock();
   }
 }

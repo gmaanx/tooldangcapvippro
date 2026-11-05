@@ -993,7 +993,6 @@ async function dispatchHostBroadcastOrVisionFallback(
   if (
     !currentSettings.geminiApiKey &&
     !currentSettings.groqApiKey &&
-    !currentSettings.mistralApiKey &&
     !currentSettings.openRouterApiKey
   ) {
     setTimeout(() => {

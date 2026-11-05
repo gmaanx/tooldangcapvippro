@@ -24,7 +24,6 @@ export interface RaceResult {
     | 'tier3_groq'
     | 'tier3_gemini'
     | 'tier3_openrouter'
-    | 'tier3_mistral'
     | 'tier3_local_ai'
   >;
   latencyMs: number;
@@ -121,16 +120,13 @@ const AUTH_CIRCUIT_BREAKER_TTL_MS = 5 * 60 * 1000;
 const NON_CHAT_MODEL_PATTERN =
   /(?:whisper|tts|orpheus|playai|guard|safeguard|embed|moderation|rerank)/i;
 const REASONING_MODEL_PATTERN =
-  /(?:gpt-oss|qwen|qwq|deepseek|r1|openrouter\/free|magistral)/i;
-const VISION_CAPABLE_PATTERN = /(?:vision|llama-4|qwen3\.8|pixtral)/i;
+  /(?:gpt-oss|qwen|qwq|deepseek|r1|openrouter\/free)/i;
+const VISION_CAPABLE_PATTERN = /(?:vision|llama-4|qwen3\.8)/i;
 
 let groqStateHydrated = false;
 let groqModelState: PersistedGroqModelState | null = null;
 let groqModelsFetchInFlight: Promise<string[]> | null = null;
 let verifiedOpenRouterModel: { keyHash: string; modelId: string } | null = null;
-let verifiedMistralTextModel: { keyHash: string; modelId: string } | null = null;
-let verifiedMistralVisionModel: { keyHash: string; modelId: string } | null =
-  null;
 
 const authCircuitBreaker = new Map<
   string,
@@ -803,90 +799,6 @@ export async function runOpenRouterTextCompletionWithFallback(
   throw new Error(lastError);
 }
 
-export async function runMistralTextCompletionWithFallback(
-  systemInstruction: string,
-  userPrompt: string,
-  optionCount: number,
-  multiSelect: boolean,
-  apiKey: string,
-  signal: AbortSignal
-): Promise<number[]> {
-  const keyHash = computeFnv1aHash(apiKey);
-  const candidates: string[] = [];
-  if (verifiedMistralTextModel && verifiedMistralTextModel.keyHash === keyHash) {
-    candidates.push(verifiedMistralTextModel.modelId);
-  }
-  for (const model of MODELS.MISTRAL_TEXT_CANDIDATES) {
-    if (!candidates.includes(model)) {
-      candidates.push(model);
-    }
-  }
-
-  let lastError = 'Mistral inference failed';
-
-  for (let attempt = 0; attempt < Math.min(3, candidates.length); attempt += 1) {
-    const modelId = candidates[attempt];
-
-    const response = await fetch(API_ENDPOINTS.MISTRAL_CHAT_COMPLETIONS, {
-      method: 'POST',
-      signal,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: userPrompt },
-        ],
-        temperature: 0,
-        max_tokens: 12,
-        stream: false,
-      }),
-    });
-
-    if (!response.ok) {
-      let detail = '';
-      try {
-        const errBody = (await response.json()) as OpenAiChatResponse;
-        const msg = errBody.error?.message ?? errBody.message;
-        detail = msg ? `: ${msg}` : '';
-      } catch {
-        void 0;
-      }
-      lastError = `Mistral HTTP ${response.status}${detail}`;
-
-      if (response.status === 401 || response.status === 403) {
-        recordProviderAuthFailure('mistral', apiKey, response.status, lastError);
-        throw new Error(lastError);
-      }
-
-      if (
-        response.status === 404 ||
-        response.status === 400 ||
-        response.status === 429
-      ) {
-        continue;
-      }
-      throw new Error(lastError);
-    }
-
-    const json = (await response.json()) as OpenAiChatResponse;
-    const content = extractOpenAiMessageText(json.choices?.[0]?.message?.content);
-    const indices = parseAnswerIndices(content, optionCount, multiSelect);
-
-    if (indices.length > 0) {
-      verifiedMistralTextModel = { keyHash, modelId };
-      return indices;
-    }
-
-    lastError = `Mistral (${modelId}) returned no valid answer index`;
-  }
-
-  throw new Error(lastError);
-}
-
 export async function runGeminiTextCompletion(
   systemInstruction: string,
   userPrompt: string,
@@ -1040,113 +952,6 @@ export async function runGroqVisionCompletionWithFallback(
 
     excluded.add(modelId);
     lastError = `Groq Vision (${modelId}) returned no valid index`;
-  }
-
-  throw new Error(lastError);
-}
-
-export async function runMistralVisionCompletionWithFallback(
-  systemInstruction: string,
-  visionPrompt: string,
-  base64: string,
-  mimeType: string,
-  optionCount: number,
-  multiSelect: boolean,
-  apiKey: string,
-  signal: AbortSignal
-): Promise<{ indices: number[]; hostOnlyBlank?: boolean }> {
-  const keyHash = computeFnv1aHash(apiKey);
-  const candidates: string[] = [];
-  if (
-    verifiedMistralVisionModel &&
-    verifiedMistralVisionModel.keyHash === keyHash
-  ) {
-    candidates.push(verifiedMistralVisionModel.modelId);
-  }
-  for (const model of MODELS.MISTRAL_VISION_CANDIDATES) {
-    if (!candidates.includes(model)) {
-      candidates.push(model);
-    }
-  }
-
-  let lastError = 'Mistral Vision inference failed';
-  const dataImageUri = 'data:' + mimeType + ';base64,' + base64;
-
-  for (let attempt = 0; attempt < candidates.length; attempt += 1) {
-    const modelId = candidates[attempt];
-
-    const response = await fetch(API_ENDPOINTS.MISTRAL_CHAT_COMPLETIONS, {
-      method: 'POST',
-      signal,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: visionPrompt },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: dataImageUri,
-                },
-              },
-            ],
-          },
-        ],
-        temperature: 0,
-        max_tokens: 14,
-        stream: false,
-      }),
-    });
-
-    if (!response.ok) {
-      let detail = '';
-      try {
-        const errBody = (await response.json()) as OpenAiChatResponse;
-        const msg = errBody.error?.message ?? errBody.message;
-        detail = msg ? `: ${msg}` : '';
-      } catch {
-        void 0;
-      }
-      lastError = `Mistral Vision HTTP ${response.status}${detail}`;
-
-      if (response.status === 401 || response.status === 403) {
-        recordProviderAuthFailure('mistral', apiKey, response.status, lastError);
-        throw new Error(lastError);
-      }
-
-      if (
-        response.status === 404 ||
-        response.status === 400 ||
-        response.status === 429
-      ) {
-        continue;
-      }
-      throw new Error(lastError);
-    }
-
-    const json = (await response.json()) as OpenAiChatResponse;
-    const rawContent = extractOpenAiMessageText(
-      json.choices?.[0]?.message?.content
-    );
-    if (rawContent.toUpperCase().includes('NONE')) {
-      verifiedMistralVisionModel = { keyHash, modelId };
-      return { indices: [], hostOnlyBlank: true };
-    }
-
-    const indices = parseAnswerIndices(rawContent, optionCount, multiSelect);
-    if (indices.length > 0) {
-      verifiedMistralVisionModel = { keyHash, modelId };
-      return { indices };
-    }
-
-    lastError = `Mistral Vision (${modelId}) returned no valid index`;
   }
 
   throw new Error(lastError);
@@ -1408,13 +1213,6 @@ export async function raceCustomPromptInference(
       mutedMsg: isProviderKeyMuted('openrouter', settings.openRouterApiKey),
     });
   }
-  if (settings.mistralApiKey.length > 0) {
-    configuredProviders.push({
-      provider: 'mistral',
-      apiKey: settings.mistralApiKey,
-      mutedMsg: isProviderKeyMuted('mistral', settings.mistralApiKey),
-    });
-  }
 
   if (configuredProviders.length === 0) {
     const localOnly = await tryChromeBuiltInLocalAi(
@@ -1428,7 +1226,7 @@ export async function raceCustomPromptInference(
       return localOnly;
     }
     throw new Error(
-      'Configure at least one API key (Groq, Gemini, OpenRouter, or Mistral) in Popup.'
+      'Configure at least one API key (Groq, Gemini, or OpenRouter) in Popup.'
     );
   }
 
@@ -1467,21 +1265,6 @@ export async function raceCustomPromptInference(
         weight: 1.28,
         run: (signal) =>
           runOpenRouterTextCompletionWithFallback(
-            systemInstruction,
-            userPrompt,
-            optionCount,
-            multiSelect,
-            entry.apiKey,
-            signal
-          ),
-      });
-    } else if (entry.provider === 'mistral') {
-      voters.push({
-        id: 'mistral-primary',
-        tier: 'tier3_mistral',
-        weight: 1.26,
-        run: (signal) =>
-          runMistralTextCompletionWithFallback(
             systemInstruction,
             userPrompt,
             optionCount,
@@ -1640,17 +1423,6 @@ export async function warmupProviderConnections(
     warmupTasks.push(
       silentGet(API_ENDPOINTS.OPENROUTER_MODELS, {
         Authorization: `Bearer ${settings.openRouterApiKey}`,
-      })
-    );
-  }
-
-  if (
-    settings.mistralApiKey &&
-    !isProviderKeyMuted('mistral', settings.mistralApiKey)
-  ) {
-    warmupTasks.push(
-      silentGet(API_ENDPOINTS.MISTRAL_MODELS, {
-        Authorization: `Bearer ${settings.mistralApiKey}`,
       })
     );
   }

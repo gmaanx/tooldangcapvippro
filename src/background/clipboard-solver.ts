@@ -18,7 +18,6 @@ import {
   raceCustomPromptInference,
   recordProviderAuthFailure,
   runGroqVisionCompletionWithFallback,
-  runMistralVisionCompletionWithFallback,
 } from './ai-racer';
 import { lookupLearnedCache, lookupTier1Cache } from './quiz-cache';
 
@@ -153,19 +152,16 @@ async function solveClipboardImage(
 ): Promise<ClipboardSolveResult> {
   const hasGemini = settings.geminiApiKey.length > 0;
   const hasGroq = settings.groqApiKey.length > 0;
-  const hasMistral = settings.mistralApiKey.length > 0;
 
-  if (!hasGemini && !hasGroq && !hasMistral) {
-    throw new Error('Configure Groq, Gemini, or Mistral API key in Popup.');
+  if (!hasGemini && !hasGroq) {
+    throw new Error('Configure Groq or Gemini API key in Popup.');
   }
 
   const geminiAbort = new AbortController();
   const groqAbort = new AbortController();
-  const mistralAbort = new AbortController();
   const timeoutHandle = setTimeout(() => {
     geminiAbort.abort();
     groqAbort.abort();
-    mistralAbort.abort();
   }, INFERENCE_TIMEOUT_MS + 1800);
 
   try {
@@ -205,18 +201,12 @@ async function solveClipboardImage(
     const groqMuted = hasGroq
       ? isProviderKeyMuted('groq', settings.groqApiKey)
       : null;
-    const mistralMuted = hasMistral
-      ? isProviderKeyMuted('mistral', settings.mistralApiKey)
-      : null;
 
     const anyUnmuted =
-      (hasGemini && !geminiMuted) ||
-      (hasGroq && !groqMuted) ||
-      (hasMistral && !mistralMuted);
+      (hasGemini && !geminiMuted) || (hasGroq && !groqMuted);
 
     const runGemini = hasGemini && (!anyUnmuted || !geminiMuted);
     const runGroq = hasGroq && (!anyUnmuted || !groqMuted);
-    const runMistral = hasMistral && (!anyUnmuted || !mistralMuted);
 
     const tasks: Array<Promise<number[]>> = [];
 
@@ -258,29 +248,6 @@ async function solveClipboardImage(
       );
     }
 
-    if (runMistral) {
-      tasks.push(
-        (async () => {
-          const mistralRes = await runMistralVisionCompletionWithFallback(
-            systemInstruction,
-            clipboardVisionPrompt,
-            base64,
-            mimeType,
-            safeOptionCount,
-            multiSelect,
-            settings.mistralApiKey,
-            mistralAbort.signal
-          );
-          if (mistralRes.indices.length === 0) {
-            throw new Error(
-              'No quiz question detected in snipped clipboard image.'
-            );
-          }
-          return mistralRes.indices;
-        })()
-      );
-    }
-
     try {
       const winningIndices = await Promise.any(tasks);
       return {
@@ -300,7 +267,6 @@ async function solveClipboardImage(
     clearTimeout(timeoutHandle);
     geminiAbort.abort();
     groqAbort.abort();
-    mistralAbort.abort();
   }
 }
 

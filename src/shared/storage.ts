@@ -50,10 +50,6 @@ export async function loadSettings(): Promise<EngineSettings> {
       typeof raw.openRouterApiKey === 'string'
         ? raw.openRouterApiKey.trim()
         : DEFAULT_SETTINGS.openRouterApiKey,
-    mistralApiKey:
-      typeof raw.mistralApiKey === 'string'
-        ? raw.mistralApiKey.trim()
-        : DEFAULT_SETTINGS.mistralApiKey,
     consensusMode:
       raw.consensusMode === 'fastest_first' ||
       raw.consensusMode === 'consensus_vote'

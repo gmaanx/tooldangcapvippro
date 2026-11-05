@@ -21,7 +21,6 @@ export const DEFAULT_SETTINGS: EngineSettings = {
   groqApiKey: '',
   geminiApiKey: '',
   openRouterApiKey: '',
-  mistralApiKey: '',
   consensusMode: 'consensus_vote',
   pinnedContext: '',
   triggerMode: 'instant_auto_click',
@@ -78,8 +77,6 @@ export const API_ENDPOINTS = {
   OPENROUTER_CHAT_COMPLETIONS:
     'https://openrouter.ai/api/v1/chat/completions',
   OPENROUTER_MODELS: 'https://openrouter.ai/api/v1/models',
-  MISTRAL_CHAT_COMPLETIONS: 'https://api.mistral.ai/v1/chat/completions',
-  MISTRAL_MODELS: 'https://api.mistral.ai/v1/models',
 } as const;
 
 export const MODELS = {
@@ -112,15 +109,6 @@ export const MODELS = {
     'deepseek/deepseek-chat-v3-0324:free',
     'meta-llama/llama-4-maverick:free',
     'qwen/qwen3-235b-a22b:free',
-  ],
-  MISTRAL_TEXT_CANDIDATES: [
-    'mistral-small-latest',
-    'mistral-medium-latest',
-    'open-mistral-nemo',
-  ],
-  MISTRAL_VISION_CANDIDATES: [
-    'pixtral-12b-latest',
-    'mistral-small-latest',
   ],
 } as const;
 

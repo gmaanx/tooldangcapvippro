@@ -55,8 +55,6 @@ function formatTierName(tier: ResolutionTier | null): string {
       return 'T3 Gemini';
     case 'tier3_openrouter':
       return 'T3 Router';
-    case 'tier3_mistral':
-      return 'T3 Mistral';
     case 'tier3_local_ai':
       return 'T3 Nano';
     case 'tier4_vision':
@@ -325,8 +323,6 @@ function populateForm(settings: EngineSettings): void {
     settings.geminiApiKey;
   queryRequired<HTMLInputElement>('#openrouter-api-key').value =
     settings.openRouterApiKey;
-  queryRequired<HTMLInputElement>('#mistral-api-key').value =
-    settings.mistralApiKey;
   queryRequired<HTMLTextAreaElement>('#pinned-context').value =
     settings.pinnedContext;
 
@@ -399,9 +395,6 @@ function readFormSettings(): EngineSettings {
     openRouterApiKey: queryRequired<HTMLInputElement>(
       '#openrouter-api-key'
     ).value.trim(),
-    mistralApiKey: queryRequired<HTMLInputElement>(
-      '#mistral-api-key'
-    ).value.trim(),
     consensusMode,
     pinnedContext: queryRequired<HTMLTextAreaElement>('#pinned-context').value,
     triggerMode,
@@ -434,11 +427,6 @@ async function initializePopup(): Promise<void> {
     '#toggle-openrouter-key',
     '#openrouter-api-key',
     'OpenRouter API key'
-  );
-  bindPasswordToggle(
-    '#toggle-mistral-key',
-    '#mistral-api-key',
-    'Mistral API key'
   );
 
   syncTargetScoreSliderUi();

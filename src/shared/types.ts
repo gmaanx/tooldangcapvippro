@@ -6,7 +6,7 @@ export type TriggerMode =
 
 export type ConsensusMode = 'consensus_vote' | 'fastest_first';
 
-export type AiProviderId = 'groq' | 'gemini' | 'openrouter' | 'mistral';
+export type AiProviderId = 'groq' | 'gemini' | 'openrouter';
 
 export type ResolutionTier =
   | 'tier1_cache'
@@ -15,7 +15,6 @@ export type ResolutionTier =
   | 'tier3_groq'
   | 'tier3_gemini'
   | 'tier3_openrouter'
-  | 'tier3_mistral'
   | 'tier3_local_ai'
   | 'tier4_vision'
   | 'tier4_clipboard';
@@ -26,7 +25,6 @@ export interface EngineSettings {
   groqApiKey: string;
   geminiApiKey: string;
   openRouterApiKey: string;
-  mistralApiKey: string;
   consensusMode: ConsensusMode;
   pinnedContext: string;
   triggerMode: TriggerMode;
