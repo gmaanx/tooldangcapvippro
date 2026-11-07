@@ -4,25 +4,35 @@ import {
   INFERENCE_TIMEOUT_MS,
   MODELS,
 } from '../shared/constants';
-import { parseAnswerIndices } from '../shared/normalize';
+import { parseAnswerIndices, parseFillBlankAnswer } from '../shared/normalize';
 import type {
   ClipboardExtractedPayload,
   EngineSettings,
   OffscreenClipboardRequest,
   OffscreenClipboardResponse,
+  QuestionKind,
 } from '../shared/types';
 import {
+  buildFillBlankSystemInstruction,
   buildQuizSystemInstruction,
   extractGeminiInteractionText,
   isProviderKeyMuted,
+  raceCustomFillBlankInference,
   raceCustomPromptInference,
   recordProviderAuthFailure,
   runGroqVisionCompletionWithFallback,
+  runGroqVisionFillBlankWithFallback,
 } from './ai-racer';
-import { lookupLearnedCache, lookupTier1Cache } from './quiz-cache';
+import {
+  lookupLearnedCache,
+  lookupLearnedFillBlank,
+  lookupTier1Cache,
+} from './quiz-cache';
+import { buildVisionOptionMappingLines } from './vision-solver';
 
 export interface ClipboardSolveResult {
   indices: number[];
+  fillText?: string;
   latencyMs: number;
 }
 
@@ -142,13 +152,77 @@ async function queryGeminiClipboardImage(
   return indices;
 }
 
+async function queryGeminiClipboardImageFillBlank(
+  systemInstruction: string,
+  clipboardVisionPrompt: string,
+  base64: string,
+  mimeType: 'image/webp' | 'image/png' | 'image/jpeg',
+  expectedLength: number | undefined,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<string> {
+  const response = await fetch(API_ENDPOINTS.GEMINI_INTERACTIONS, {
+    method: 'POST',
+    signal,
+    headers: {
+      'x-goog-api-key': apiKey,
+      'Content-Type': 'application/json',
+      'Api-Revision': GEMINI_API_REVISION,
+    },
+    body: JSON.stringify({
+      model: MODELS.GEMINI_PRIMARY,
+      store: false,
+      system_instruction: systemInstruction,
+      input: [
+        { type: 'text', text: clipboardVisionPrompt },
+        {
+          type: 'image',
+          data: base64,
+          mime_type: mimeType,
+        },
+      ],
+      generation_config: {
+        thinking_level: 'low',
+        seed: 0,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const errBody = (await response.json()) as {
+        error?: { message?: string };
+      };
+      detail = errBody.error?.message ? `: ${errBody.error.message}` : '';
+    } catch {
+      void 0;
+    }
+    const errMsg = `Gemini Vision HTTP ${response.status}${detail}`;
+    recordProviderAuthFailure('gemini', apiKey, response.status, errMsg);
+    throw new Error(errMsg);
+  }
+
+  const json = await response.json();
+  const rawText = extractGeminiInteractionText(json);
+  const answer = parseFillBlankAnswer(rawText, expectedLength);
+  if (!answer) {
+    throw new Error(
+      'Gemini Vision could not extract a fill-blank answer from clipboard image.'
+    );
+  }
+  return answer;
+}
+
 async function solveClipboardImage(
   base64: string,
   mimeType: 'image/webp' | 'image/png' | 'image/jpeg',
   optionCount: number,
   multiSelect: boolean,
   settings: EngineSettings,
-  startedAt: number
+  startedAt: number,
+  questionKind?: QuestionKind,
+  blankLengthHint?: number
 ): Promise<ClipboardSolveResult> {
   const hasGemini = settings.geminiApiKey.length > 0;
   const hasGroq = settings.groqApiKey.length > 0;
@@ -165,36 +239,6 @@ async function solveClipboardImage(
   }, INFERENCE_TIMEOUT_MS + 1800);
 
   try {
-    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 4));
-    const systemInstruction = buildQuizSystemInstruction(
-      multiSelect,
-      safeOptionCount,
-      settings.pinnedContext
-    );
-
-    const mappingLines =
-      safeOptionCount === 2
-        ? [
-            '0 = Blue / Diamond / Left tile / True / 1st choice',
-            '1 = Red / Triangle / Right tile / False / 2nd choice',
-          ]
-        : [
-            '0 = Red / Triangle / Top-Left tile / Option A / 1st listed choice',
-            '1 = Blue / Diamond / Top-Right tile / Option B / 2nd listed choice',
-            '2 = Yellow / Circle / Bottom-Left tile / Option C / 3rd listed choice',
-            '3 = Green / Square / Bottom-Right tile / Option D / 4th listed choice',
-          ];
-
-    const clipboardVisionPrompt = [
-      'Analyze this snipped quiz question image and determine the correct Kahoot answer index.',
-      'Index mapping rules:',
-      ...mappingLines,
-      'If no quiz question or visual problem is visible in the image, output NONE.',
-      multiSelect
-        ? 'Output ONLY the comma-separated zero-based indices of all correct choices (e.g. 0,2).'
-        : `Output ONLY the single zero-based integer index (0 to ${safeOptionCount - 1}) of the correct choice.`,
-    ].join('\n');
-
     const geminiMuted = hasGemini
       ? isProviderKeyMuted('gemini', settings.geminiApiKey)
       : null;
@@ -207,6 +251,79 @@ async function solveClipboardImage(
 
     const runGemini = hasGemini && (!anyUnmuted || !geminiMuted);
     const runGroq = hasGroq && (!anyUnmuted || !groqMuted);
+
+    if (questionKind === 'fill_blank') {
+      const systemInstruction = buildFillBlankSystemInstruction(
+        blankLengthHint,
+        settings.pinnedContext
+      );
+      const fillVisionPrompt = [
+        'Analyze this snipped quiz question image and determine the exact Fill-in-the-Blank answer.',
+        'Output ONLY the exact missing word, number, or short phrase with zero explanation.',
+      ].join('\n');
+
+      const fillTasks: Array<Promise<string>> = [];
+      if (runGemini) {
+        fillTasks.push(
+          queryGeminiClipboardImageFillBlank(
+            systemInstruction,
+            fillVisionPrompt,
+            base64,
+            mimeType,
+            blankLengthHint,
+            settings.geminiApiKey,
+            geminiAbort.signal
+          )
+        );
+      }
+      if (runGroq) {
+        fillTasks.push(
+          (async () => {
+            const groqRes = await runGroqVisionFillBlankWithFallback(
+              systemInstruction,
+              fillVisionPrompt,
+              base64,
+              mimeType,
+              blankLengthHint,
+              settings.groqApiKey,
+              groqAbort.signal
+            );
+            if (!groqRes.fillText) {
+              throw new Error(
+                'No quiz answer detected in snipped clipboard image.'
+              );
+            }
+            return groqRes.fillText;
+          })()
+        );
+      }
+
+      const winningText = await Promise.any(fillTasks);
+      return {
+        indices: [],
+        fillText: winningText,
+        latencyMs: Math.round(performance.now() - startedAt),
+      };
+    }
+
+    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 8));
+    const systemInstruction = buildQuizSystemInstruction(
+      multiSelect,
+      safeOptionCount,
+      settings.pinnedContext
+    );
+
+    const mappingLines = buildVisionOptionMappingLines(safeOptionCount);
+
+    const clipboardVisionPrompt = [
+      'Analyze this snipped quiz question image and determine the correct zero-based answer index.',
+      'Index mapping rules:',
+      ...mappingLines,
+      'If no quiz question or visual problem is visible in the image, output NONE.',
+      multiSelect
+        ? 'Output ONLY the comma-separated zero-based indices of all correct choices (e.g. 0,2).'
+        : `Output ONLY the single zero-based integer index (0 to ${safeOptionCount - 1}) of the correct choice.`,
+    ].join('\n');
 
     const tasks: Array<Promise<number[]>> = [];
 
@@ -275,8 +392,38 @@ async function solveClipboardText(
   optionCount: number,
   multiSelect: boolean,
   settings: EngineSettings,
-  startedAt: number
+  startedAt: number,
+  questionKind?: QuestionKind,
+  blankLengthHint?: number
 ): Promise<ClipboardSolveResult> {
+  if (questionKind === 'fill_blank') {
+    const learnedFill = await lookupLearnedFillBlank(copiedText);
+    if (learnedFill) {
+      return {
+        indices: [],
+        fillText: learnedFill,
+        latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      };
+    }
+
+    const systemInstruction = buildFillBlankSystemInstruction(
+      blankLengthHint,
+      settings.pinnedContext
+    );
+    const ensembleFill = await raceCustomFillBlankInference(
+      systemInstruction,
+      `Question: ${copiedText}`,
+      blankLengthHint,
+      settings,
+      startedAt
+    );
+    return {
+      indices: [],
+      fillText: ensembleFill.fillText,
+      latencyMs: ensembleFill.latencyMs,
+    };
+  }
+
   const cached = await lookupTier1Cache(copiedText, []);
   if (cached && cached.length > 0) {
     return {
@@ -293,18 +440,16 @@ async function solveClipboardText(
     };
   }
 
-  const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 4));
+  const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 8));
   const systemInstruction = buildQuizSystemInstruction(
     multiSelect,
     safeOptionCount,
     settings.pinnedContext
   );
+  const mappingLines = buildVisionOptionMappingLines(safeOptionCount);
   const textPrompt = [
-    'Solve this copied quiz question and map the correct answer to a zero-based Kahoot index:',
-    '0 = Option A / 1st choice / Red',
-    '1 = Option B / 2nd choice / Blue',
-    '2 = Option C / 3rd choice / Yellow',
-    '3 = Option D / 4th choice / Green',
+    'Solve this copied quiz question and map the correct answer to a zero-based index:',
+    ...mappingLines,
     '',
     copiedText,
   ].join('\n');
@@ -328,7 +473,9 @@ export async function resolveFromClipboardPayload(
   clipboard: ClipboardExtractedPayload,
   optionCount: number,
   multiSelect: boolean,
-  settings: EngineSettings
+  settings: EngineSettings,
+  questionKind?: QuestionKind,
+  blankLengthHint?: number
 ): Promise<ClipboardSolveResult> {
   if (clipboard.kind === 'empty') {
     throw new Error(
@@ -350,7 +497,9 @@ export async function resolveFromClipboardPayload(
         optionCount,
         multiSelect,
         settings,
-        startedAt
+        startedAt,
+        questionKind,
+        blankLengthHint
       );
     }
 
@@ -360,7 +509,9 @@ export async function resolveFromClipboardPayload(
         optionCount,
         multiSelect,
         settings,
-        startedAt
+        startedAt,
+        questionKind,
+        blankLengthHint
       );
     }
 
@@ -373,13 +524,17 @@ export async function resolveFromClipboardPayload(
 export async function resolveViaSystemClipboard(
   optionCount: number,
   multiSelect: boolean,
-  settings: EngineSettings
+  settings: EngineSettings,
+  questionKind?: QuestionKind,
+  blankLengthHint?: number
 ): Promise<ClipboardSolveResult> {
   const clipboard = await readSystemClipboardPayload();
   return resolveFromClipboardPayload(
     clipboard,
     optionCount,
     multiSelect,
-    settings
+    settings,
+    questionKind,
+    blankLengthHint
   );
 }

@@ -55,6 +55,10 @@ export async function loadSettings(): Promise<EngineSettings> {
       raw.consensusMode === 'consensus_vote'
         ? raw.consensusMode
         : DEFAULT_SETTINGS.consensusMode,
+    antiFocusLoss:
+      typeof raw.antiFocusLoss === 'boolean'
+        ? raw.antiFocusLoss
+        : DEFAULT_SETTINGS.antiFocusLoss,
     pinnedContext:
       typeof raw.pinnedContext === 'string'
         ? raw.pinnedContext

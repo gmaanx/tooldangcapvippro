@@ -2,8 +2,14 @@ import {
   BRIDGE_SOURCE,
   ISOLATED_BRIDGE_SOURCE,
   SELECTORS,
+  WAYGROUND_SELECTORS,
 } from '../shared/constants';
-import { extractGamePin, extractUuid } from '../shared/normalize';
+import {
+  extractGamePin,
+  extractUuid,
+  isKahootHostname,
+  isWaygroundHostname,
+} from '../shared/normalize';
 import type {
   IsolatedToMainClickEnvelope,
   KahootChallengePinPayload,
@@ -19,6 +25,7 @@ declare global {
   interface Window {
     __kahootHybridMainWorldInstalled?: boolean;
     __kahootHybridClickListenerAttached?: boolean;
+    __kahootHybridFocusGuardInstalled?: boolean;
     __kahootHybridMainClickHandler?: (
       envelope: IsolatedToMainClickEnvelope
     ) => void;
@@ -39,6 +46,135 @@ interface CometdEnvelope {
 interface KahootWsChoice {
   answer?: string;
   text?: string;
+}
+
+const IS_WAYGROUND_HOST = isWaygroundHostname(window.location.hostname);
+const IS_KAHOOT_HOST = isKahootHostname(window.location.hostname);
+
+function isFocusGuardEnabled(): boolean {
+  const attr = document.documentElement?.getAttribute(
+    'data-hybrid-focus-guard'
+  );
+  return attr !== '0';
+}
+
+function installWaygroundFocusGuard(): void {
+  if (!IS_WAYGROUND_HOST || window.__kahootHybridFocusGuardInstalled) {
+    return;
+  }
+  window.__kahootHybridFocusGuardInstalled = true;
+
+  try {
+    const docProto = Document.prototype;
+    const origVisibility = Object.getOwnPropertyDescriptor(
+      docProto,
+      'visibilityState'
+    );
+    const origWebkitVisibility = Object.getOwnPropertyDescriptor(
+      docProto,
+      'webkitVisibilityState'
+    );
+    const origHidden = Object.getOwnPropertyDescriptor(docProto, 'hidden');
+    const origWebkitHidden = Object.getOwnPropertyDescriptor(
+      docProto,
+      'webkitHidden'
+    );
+    const origHasFocus = docProto.hasFocus;
+
+    Object.defineProperty(docProto, 'visibilityState', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (isFocusGuardEnabled()) {
+          return 'visible';
+        }
+        return origVisibility?.get ? origVisibility.get.call(this) : 'visible';
+      },
+    });
+
+    if (origWebkitVisibility) {
+      Object.defineProperty(docProto, 'webkitVisibilityState', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          if (isFocusGuardEnabled()) {
+            return 'visible';
+          }
+          return origWebkitVisibility.get
+            ? origWebkitVisibility.get.call(this)
+            : 'visible';
+        },
+      });
+    }
+
+    Object.defineProperty(docProto, 'hidden', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (isFocusGuardEnabled()) {
+          return false;
+        }
+        return origHidden?.get ? origHidden.get.call(this) : false;
+      },
+    });
+
+    if (origWebkitHidden) {
+      Object.defineProperty(docProto, 'webkitHidden', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          if (isFocusGuardEnabled()) {
+            return false;
+          }
+          return origWebkitHidden.get ? origWebkitHidden.get.call(this) : false;
+        },
+      });
+    }
+
+    if (typeof origHasFocus === 'function') {
+      docProto.hasFocus = function patchedHasFocus(): boolean {
+        if (isFocusGuardEnabled()) {
+          return true;
+        }
+        return origHasFocus.call(this);
+      };
+    }
+  } catch {
+    void 0;
+  }
+
+  const swallowVisibilityEvent = (event: Event): void => {
+    if (!isFocusGuardEnabled()) {
+      return;
+    }
+    event.stopImmediatePropagation();
+    event.stopPropagation();
+  };
+
+  const swallowWindowBlurEvent = (event: Event): void => {
+    if (!isFocusGuardEnabled()) {
+      return;
+    }
+    if (
+      event.target === window ||
+      event.target === document ||
+      event.target === document.documentElement
+    ) {
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+    }
+  };
+
+  window.addEventListener('visibilitychange', swallowVisibilityEvent, true);
+  document.addEventListener('visibilitychange', swallowVisibilityEvent, true);
+  document.addEventListener(
+    'webkitvisibilitychange',
+    swallowVisibilityEvent,
+    true
+  );
+  window.addEventListener('blur', swallowWindowBlurEvent, true);
+  document.addEventListener('blur', swallowWindowBlurEvent, true);
+  document.addEventListener('mouseleave', swallowWindowBlurEvent, true);
 }
 
 function markMainBridgeReady(): void {
@@ -300,7 +436,56 @@ function inspectWebSocketFrame(rawFrame: string): void {
   }
 }
 
+function collectWaygroundVisibleChoices(): HTMLElement[] {
+  const indexed = new Map<number, HTMLElement>();
+  for (let i = 0; i < 8; i += 1) {
+    const nodes = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        WAYGROUND_SELECTORS.INDEXED_OPTION(i)
+      )
+    );
+    for (const node of nodes) {
+      const r = node.getBoundingClientRect();
+      if (r.width <= 8 || r.height <= 8) {
+        continue;
+      }
+      const existing = indexed.get(i);
+      const testId = node.getAttribute('data-testid') ?? '';
+      if (!existing || testId.startsWith('option-trigger-')) {
+        indexed.set(i, node);
+      }
+    }
+  }
+  if (indexed.size >= 2) {
+    return Array.from(indexed.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map((entry) => entry[1]);
+  }
+
+  const rawCandidates = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      WAYGROUND_SELECTORS.ALL_OPTION_CANDIDATES
+    )
+  );
+  const deduped: HTMLElement[] = [];
+  for (const el of rawCandidates) {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 12 || r.height <= 12) {
+      continue;
+    }
+    if (deduped.some((prev) => prev.contains(el) || el.contains(prev))) {
+      continue;
+    }
+    deduped.push(el);
+  }
+  return deduped;
+}
+
 function findVisibleChoiceElement(index: number): HTMLElement | null {
+  if (IS_WAYGROUND_HOST) {
+    return collectWaygroundVisibleChoices()[index] ?? null;
+  }
+
   const candidates = Array.from(
     document.querySelectorAll<HTMLElement>(SELECTORS.ANSWER_BY_INDEX(index))
   );
@@ -322,6 +507,30 @@ function findVisibleChoiceElement(index: number): HTMLElement | null {
 }
 
 function findVisibleSubmitButton(): HTMLElement | null {
+  if (IS_WAYGROUND_HOST) {
+    const wgCandidates = Array.from(
+      document.querySelectorAll<HTMLElement>(WAYGROUND_SELECTORS.SUBMIT_BUTTON)
+    );
+    for (const el of wgCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 8 && rect.height > 8) {
+        return el;
+      }
+    }
+    const textBtns = Array.from(document.querySelectorAll<HTMLElement>('button'));
+    for (const btn of textBtns) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width <= 8 || rect.height <= 8) {
+        continue;
+      }
+      const label = (btn.textContent ?? '').replace(/\s+/g, ' ').trim();
+      if (/^(?:submit|save|send|done|nộp|gửi|xác nhận)$/i.test(label)) {
+        return btn;
+      }
+    }
+    return null;
+  }
+
   const candidates = Array.from(
     document.querySelectorAll<HTMLElement>(SELECTORS.MULTI_SELECT_SUBMIT)
   );
@@ -339,7 +548,7 @@ function resolveSingleChoiceClickable(rawTarget: HTMLElement): HTMLElement {
     return rawTarget;
   }
   const innerBtn = rawTarget.querySelector<HTMLElement>(
-    'button, [role="button"]'
+    'button, [role="button"], [role="option"], [role="checkbox"]'
   );
   if (innerBtn) {
     const r = innerBtn.getBoundingClientRect();
@@ -347,11 +556,13 @@ function resolveSingleChoiceClickable(rawTarget: HTMLElement): HTMLElement {
       return innerBtn;
     }
   }
-  const ancestorBtn = rawTarget.closest<HTMLElement>('button, [role="button"]');
-  if (
-    ancestorBtn &&
-    ancestorBtn.querySelectorAll(SELECTORS.ANSWER_PREFIX).length <= 1
-  ) {
+  const ancestorBtn = rawTarget.closest<HTMLElement>(
+    'button, [role="button"], [role="option"]'
+  );
+  const guardSel = IS_WAYGROUND_HOST
+    ? WAYGROUND_SELECTORS.ALL_OPTION_CANDIDATES
+    : SELECTORS.ANSWER_PREFIX;
+  if (ancestorBtn && ancestorBtn.querySelectorAll(guardSel).length <= 1) {
     return ancestorBtn;
   }
   return rawTarget;
@@ -437,7 +648,95 @@ function triggerMainWorldNativeClick(rawTarget: HTMLElement): void {
   target.click();
 }
 
+function triggerMainWorldTextFill(fillText: string, autoSubmit: boolean): void {
+  const inputs = Array.from(
+    document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+      WAYGROUND_SELECTORS.BLANK_INPUTS
+    )
+  ).filter((el) => {
+    if (el.disabled || el.readOnly) {
+      return false;
+    }
+    const r = el.getBoundingClientRect();
+    return r.width > 10 && r.height > 10;
+  });
+
+  if (inputs.length === 0) {
+    return;
+  }
+
+  const inputValueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLInputElement.prototype,
+    'value'
+  )?.set;
+  const areaValueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype,
+    'value'
+  )?.set;
+
+  const isCharGrid =
+    inputs.length > 1 &&
+    inputs.every(
+      (inp) =>
+        inp instanceof HTMLInputElement &&
+        (inp.maxLength === 1 || inp.classList.contains('box-input'))
+    );
+
+  if (isCharGrid) {
+    const compact = fillText.replace(/\s+/g, '');
+    const chars = Array.from(
+      compact.length === inputs.length ? compact : fillText
+    );
+    inputs.forEach((inp, idx) => {
+      const ch = chars[idx] ?? '';
+      inp.focus();
+      inputValueSetter?.call(inp, ch);
+      inp.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  } else {
+    const first = inputs[0];
+    first.focus();
+    if (first instanceof HTMLTextAreaElement) {
+      areaValueSetter?.call(first, fillText);
+    } else {
+      inputValueSetter?.call(first, fillText);
+    }
+    first.dispatchEvent(
+      new InputEvent('input', { bubbles: true, data: fillText })
+    );
+    first.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  if (autoSubmit) {
+    setTimeout(() => {
+      const submitBtn = findVisibleSubmitButton();
+      if (submitBtn && isMainWorldElementClickable(submitBtn)) {
+        triggerMainWorldNativeClick(submitBtn);
+      } else {
+        inputs[inputs.length - 1].dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+          })
+        );
+      }
+    }, 100);
+  }
+}
+
 function handleIsolatedClickCommand(envelope: IsolatedToMainClickEnvelope): void {
+  if (typeof envelope.fillText === 'string' && envelope.fillText.length > 0) {
+    triggerMainWorldTextFill(
+      envelope.fillText,
+      envelope.autoSubmit !== false
+    );
+    return;
+  }
+
   if (envelope.submitMultiSelect) {
     const submitBtn = findVisibleSubmitButton();
     if (submitBtn && isMainWorldElementClickable(submitBtn)) {
@@ -487,9 +786,10 @@ function installClickBridgeAlways(): void {
 }
 
 function installMainWorldInterceptors(): void {
+  installWaygroundFocusGuard();
   installClickBridgeAlways();
 
-  if (window.__kahootHybridMainWorldInstalled) {
+  if (!IS_KAHOOT_HOST || window.__kahootHybridMainWorldInstalled) {
     return;
   }
   window.__kahootHybridMainWorldInstalled = true;

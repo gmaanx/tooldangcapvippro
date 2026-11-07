@@ -8,6 +8,10 @@ export type ConsensusMode = 'consensus_vote' | 'fastest_first';
 
 export type AiProviderId = 'groq' | 'gemini' | 'openrouter';
 
+export type QuizPlatform = 'kahoot' | 'wayground';
+
+export type QuestionKind = 'choice' | 'fill_blank';
+
 export type ResolutionTier =
   | 'tier1_cache'
   | 'tier1_learned'
@@ -26,6 +30,7 @@ export interface EngineSettings {
   geminiApiKey: string;
   openRouterApiKey: string;
   consensusMode: ConsensusMode;
+  antiFocusLoss: boolean;
   pinnedContext: string;
   triggerMode: TriggerMode;
   targetScore: number;
@@ -51,12 +56,18 @@ export interface QuestionPayload {
   multiSelect: boolean;
   optionCount: number;
   source: 'websocket' | 'dom';
+  platform?: QuizPlatform;
+  questionKind?: QuestionKind;
+  blankLengthHint?: number;
+  hasQuestionImage?: boolean;
 }
 
 export interface AnswerResolution {
   stateHash: string;
   questionIndex: number;
   indices: number[];
+  fillText?: string;
+  questionKind?: QuestionKind;
   tier: ResolutionTier;
   latencyMs: number;
   timestamp: number;
@@ -80,6 +91,7 @@ export interface SerializedQuizCache {
 export interface LearnedQuestionEntry {
   choiceTexts: string[];
   indices: number[];
+  fillText?: string;
   verified: boolean;
   updatedAt: number;
 }
@@ -137,6 +149,8 @@ export interface IsolatedToMainClickEnvelope {
   type: 'EXEC_MAIN_WORLD_CLICK';
   indices: number[];
   submitMultiSelect?: boolean;
+  fillText?: string;
+  autoSubmit?: boolean;
 }
 
 export interface ClipboardExtractedPayload {
@@ -177,10 +191,16 @@ export type RuntimeRequestMessage =
       useMouseEvents?: boolean;
     }
   | {
+      type: 'EXEC_DIRECT_TEXT_FILL';
+      fillText: string;
+      autoSubmit: boolean;
+    }
+  | {
       type: 'LEARN_VERIFIED_ANSWER';
       questionText: string;
       options: string[];
       indices: number[];
+      fillText?: string;
     }
   | {
       type: 'TRIGGER_VISION_FALLBACK';
@@ -188,6 +208,8 @@ export type RuntimeRequestMessage =
       questionIndex: number;
       optionCount: number;
       multiSelect: boolean;
+      questionKind?: QuestionKind;
+      blankLengthHint?: number;
     }
   | {
       type: 'TRIGGER_CLIPBOARD_VISION';
@@ -195,6 +217,8 @@ export type RuntimeRequestMessage =
       questionIndex: number;
       optionCount: number;
       multiSelect: boolean;
+      questionKind?: QuestionKind;
+      blankLengthHint?: number;
     }
   | {
       type: 'RESOLVE_DIRECT_CLIPBOARD_PAYLOAD';
@@ -202,6 +226,8 @@ export type RuntimeRequestMessage =
       questionIndex: number;
       optionCount: number;
       multiSelect: boolean;
+      questionKind?: QuestionKind;
+      blankLengthHint?: number;
       clipboard: ClipboardExtractedPayload;
     }
   | {

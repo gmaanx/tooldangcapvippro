@@ -43,13 +43,34 @@ export function extractUuid(input: string): string | null {
   return match ? match[0].toLowerCase() : null;
 }
 
+export function isWaygroundHostname(hostname: string): boolean {
+  const lower = (hostname || '').toLowerCase();
+  return (
+    lower === 'wayground.com' ||
+    lower.endsWith('.wayground.com') ||
+    lower === 'quizizz.com' ||
+    lower.endsWith('.quizizz.com') ||
+    lower === 'joinmyquiz.com' ||
+    lower.endsWith('.joinmyquiz.com')
+  );
+}
+
+export function isKahootHostname(hostname: string): boolean {
+  const lower = (hostname || '').toLowerCase();
+  return (
+    lower === 'kahoot.it' ||
+    lower === 'play.kahoot.it' ||
+    lower === 'create.kahoot.it'
+  );
+}
+
 export function extractGamePin(input: string): string | null {
   if (!input || extractUuid(input)) {
     return null;
   }
   const trimmed = input.trim();
   const challengePinMatch = trimmed.match(
-    /(?:\/challenge\/|[?&]pin=)(\d{5,10})\b/i
+    /(?:\/challenge\/|[?&](?:pin|gc)=)(\d{5,10})\b/i
   );
   if (challengePinMatch) {
     return challengePinMatch[1];
@@ -127,6 +148,53 @@ export function parseAnswerIndices(
   }
 
   return uniqueValid;
+}
+
+export function parseFillBlankAnswer(
+  rawOutput: string,
+  expectedLength?: number
+): string {
+  if (!rawOutput) {
+    return '';
+  }
+  let cleaned = rawOutput
+    .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
+    .replace(/<think>[\s\S]*$/gi, ' ')
+    .replace(/```[\s\S]*?```/g, (block) =>
+      block.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '')
+    )
+    .trim();
+
+  const lines = cleaned
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !/^none$/i.test(line));
+
+  if (lines.length === 0) {
+    return '';
+  }
+
+  let candidate = lines[lines.length - 1]
+    .replace(/^(?:final\s+answer|the\s+answer\s+is|answer|output|result)\s*[:=-]\s*/i, '')
+    .replace(/^["'`«“]+|["'`»”]+$/g, '')
+    .trim();
+
+  if (candidate.endsWith('.') && !/\b(?:e\.g|i\.e|mr|dr|ms|st|inc|ltd)\.$/i.test(candidate)) {
+    candidate = candidate.slice(0, -1).trim();
+  }
+
+  if (
+    typeof expectedLength === 'number' &&
+    expectedLength > 0 &&
+    candidate.length !== expectedLength
+  ) {
+    const compact = candidate.replace(/\s+/g, '');
+    if (compact.length === expectedLength) {
+      return compact;
+    }
+  }
+
+  return candidate;
 }
 
 const STANDARD_KAHOOT_TIMERS_SEC = [5, 10, 20, 30, 45, 60, 90, 120, 180, 240];

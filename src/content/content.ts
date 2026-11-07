@@ -8,11 +8,14 @@ import {
   STORAGE_KEYS,
   VISION_MAX_DIMENSION_PX,
   VISION_WEBP_QUALITY,
+  WAYGROUND_SELECTORS,
 } from '../shared/constants';
 import {
   buildContentSignature,
   buildQuestionStateHash,
   computeTargetScoreDelayMs,
+  isKahootHostname,
+  isWaygroundHostname,
   snapCountdownSecondsToTimerMs,
 } from '../shared/normalize';
 import { loadSettings } from '../shared/storage';
@@ -24,6 +27,7 @@ import type {
   IsolatedToMainClickEnvelope,
   MainWorldBridgeEnvelope,
   QuestionPayload,
+  QuizPlatform,
   RuntimeClickResponse,
   RuntimeRequestMessage,
   RuntimeResolveResponse,
@@ -37,10 +41,14 @@ declare global {
   }
 }
 
+const IS_WAYGROUND = isWaygroundHostname(window.location.hostname);
+const PLATFORM: QuizPlatform = IS_WAYGROUND ? 'wayground' : 'kahoot';
+
 let currentSettings: EngineSettings = { ...DEFAULT_SETTINGS };
 let currentQuestionIndex = -1;
 let syntheticRoundCounter = 0;
 let buttonsMounted = false;
+let activeDomRoundSignature: string | null = null;
 let readyButtonsPerfTimestamp = 0;
 let currentQuestionTimerMs = DEFAULT_QUESTION_TIMER_MS;
 let wsTimerCapturedForRound = false;
@@ -73,6 +81,19 @@ const triggeredContentSignatures = new Set<string>();
 const triggeredVisionRounds = new Set<number>();
 const broadcastedHostSignatures = new Set<string>();
 const appliedBroadcastHashes = new Set<string>();
+
+function syncWaygroundFocusGuardAttribute(): void {
+  if (!IS_WAYGROUND || !document.documentElement) {
+    return;
+  }
+  const desired =
+    currentSettings.enabled && currentSettings.antiFocusLoss ? '1' : '0';
+  if (
+    document.documentElement.getAttribute('data-hybrid-focus-guard') !== desired
+  ) {
+    document.documentElement.setAttribute('data-hybrid-focus-guard', desired);
+  }
+}
 
 function sendRuntimeMessage<TResponse>(
   message: RuntimeRequestMessage
@@ -120,6 +141,27 @@ function clearScheduledTimers(): void {
   clearClickVerifyTimer();
 }
 
+function resetPerRoundDomState(): void {
+  readyButtonsPerfTimestamp = 0;
+  currentQuestionTimerMs = DEFAULT_QUESTION_TIMER_MS;
+  wsTimerCapturedForRound = false;
+  lastScheduledWaitMs = 0;
+  pendingResolution = null;
+  activeRoundResolution = null;
+  pendingCommitAttempts = 0;
+  highlightedStateHash = null;
+  clickedStateHash = null;
+  clearClickVerifyTimer();
+  if (scheduledJitterTimer !== null) {
+    clearTimeout(scheduledJitterTimer);
+    scheduledJitterTimer = null;
+  }
+  if (pendingCommitRetryTimer !== null) {
+    clearTimeout(pendingCommitRetryTimer);
+    pendingCommitRetryTimer = null;
+  }
+}
+
 function resetSessionDeduplication(): void {
   triggeredStateHashes.clear();
   triggeredContentSignatures.clear();
@@ -128,66 +170,31 @@ function resetSessionDeduplication(): void {
   appliedBroadcastHashes.clear();
   currentQuestionIndex = -1;
   syntheticRoundCounter = 0;
-  readyButtonsPerfTimestamp = 0;
-  currentQuestionTimerMs = DEFAULT_QUESTION_TIMER_MS;
-  wsTimerCapturedForRound = false;
-  lastScheduledWaitMs = 0;
-  pendingResolution = null;
-  activeRoundResolution = null;
+  activeDomRoundSignature = null;
   lastRoundQuestionContext = null;
-  pendingCommitAttempts = 0;
-  highlightedStateHash = null;
-  clickedStateHash = null;
   shownDebuggerWarningHash = null;
+  resetPerRoundDomState();
   clearScheduledTimers();
 }
 
-function isVisibleMultiSelectSubmitPresent(): boolean {
-  const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>(SELECTORS.MULTI_SELECT_SUBMIT)
-  );
-  return candidates.some((el) => {
-    const rect = el.getBoundingClientRect();
-    return rect.width > 8 && rect.height > 8;
-  });
-}
-
-function parseDomQuestionCounter(): number | null {
-  const counterEl = document.querySelector<HTMLElement>(
-    SELECTORS.QUESTION_COUNTER
-  );
-  if (!counterEl) {
-    return null;
+function isActiveWaygroundQuestionRoute(): boolean {
+  const pathname = window.location.pathname.toLowerCase();
+  if (
+    pathname === '/' ||
+    pathname === '/join' ||
+    pathname === '/join/' ||
+    pathname.startsWith('/join/pre-game') ||
+    pathname.startsWith('/join/lobby') ||
+    pathname.startsWith('/join/game-over') ||
+    pathname.startsWith('/join/summary') ||
+    pathname.startsWith('/join/results') ||
+    pathname.startsWith('/admin') ||
+    pathname.startsWith('/login') ||
+    pathname.startsWith('/signup')
+  ) {
+    return false;
   }
-  const text = counterEl.textContent?.trim() ?? '';
-  const match = text.match(/^(\d+)\s*(?:\/|of)\s*\d+/i);
-  if (!match) {
-    return null;
-  }
-  const oneBased = Number.parseInt(match[1], 10);
-  return Number.isFinite(oneBased) && oneBased >= 1 ? oneBased - 1 : null;
-}
-
-function detectDomQuestionTimerMs(): number | null {
-  const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>(SELECTORS.QUESTION_TIMER)
-  );
-  for (const el of candidates) {
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 4 || rect.height <= 4) {
-      continue;
-    }
-    const text = (el.textContent ?? '').trim();
-    const match = text.match(/^(\d{1,3})$/);
-    if (!match) {
-      continue;
-    }
-    const seconds = Number.parseInt(match[1], 10);
-    if (Number.isFinite(seconds) && seconds >= 4 && seconds <= 240) {
-      return snapCountdownSecondsToTimerMs(seconds);
-    }
-  }
-  return null;
+  return true;
 }
 
 function extractIndexedAttributeNumber(rawAttr: string): number | null {
@@ -203,6 +210,54 @@ function extractIndexedAttributeNumber(rawAttr: string): number | null {
 }
 
 function getVisibleAnswerButtons(): HTMLElement[] {
+  if (IS_WAYGROUND) {
+    if (!isActiveWaygroundQuestionRoute()) {
+      return [];
+    }
+    const indexed = new Map<number, HTMLElement>();
+    for (let i = 0; i < 8; i += 1) {
+      const nodes = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          WAYGROUND_SELECTORS.INDEXED_OPTION(i)
+        )
+      );
+      for (const node of nodes) {
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 8 || rect.height <= 8) {
+          continue;
+        }
+        const existing = indexed.get(i);
+        const testId = node.getAttribute('data-testid') ?? '';
+        if (!existing || testId.startsWith('option-trigger-')) {
+          indexed.set(i, node);
+        }
+      }
+    }
+    if (indexed.size >= 2) {
+      return Array.from(indexed.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map((entry) => entry[1]);
+    }
+
+    const rawCandidates = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        WAYGROUND_SELECTORS.ALL_OPTION_CANDIDATES
+      )
+    );
+    const deduped: HTMLElement[] = [];
+    for (const el of rawCandidates) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 12 || rect.height <= 12) {
+        continue;
+      }
+      if (deduped.some((prev) => prev.contains(el) || el.contains(prev))) {
+        continue;
+      }
+      deduped.push(el);
+    }
+    return deduped.length >= 2 ? deduped.slice(0, 8) : [];
+  }
+
   const candidates = Array.from(
     document.querySelectorAll<HTMLElement>(SELECTORS.ANSWER_PREFIX)
   );
@@ -230,6 +285,10 @@ function getVisibleAnswerButtons(): HTMLElement[] {
 }
 
 function findVisibleAnswerButton(index: number): HTMLElement | null {
+  if (IS_WAYGROUND) {
+    return getVisibleAnswerButtons()[index] ?? null;
+  }
+
   const candidates = Array.from(
     document.querySelectorAll<HTMLElement>(SELECTORS.ANSWER_BY_INDEX(index))
   );
@@ -250,12 +309,187 @@ function findVisibleAnswerButton(index: number): HTMLElement | null {
   return fallback;
 }
 
+function getVisibleBlankInputs(): Array<HTMLInputElement | HTMLTextAreaElement> {
+  if (!IS_WAYGROUND || !isActiveWaygroundQuestionRoute()) {
+    return [];
+  }
+
+  const direct = Array.from(
+    document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+      WAYGROUND_SELECTORS.BLANK_INPUTS
+    )
+  ).filter((el) => {
+    if (el.disabled || el.readOnly) {
+      return false;
+    }
+    const r = el.getBoundingClientRect();
+    return r.width > 10 && r.height > 10;
+  });
+
+  if (direct.length > 0) {
+    return direct;
+  }
+
+  const stemEl = document.querySelector<HTMLElement>(
+    WAYGROUND_SELECTORS.QUESTION_TITLE
+  );
+  if (!stemEl) {
+    return [];
+  }
+  const stemRect = stemEl.getBoundingClientRect();
+  if (stemRect.width <= 20 || stemRect.height <= 10) {
+    return [];
+  }
+
+  return Array.from(
+    document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+      'input[type="text"]:not([readonly]), textarea:not([readonly])'
+    )
+  ).filter((el) => {
+    if (el.disabled) {
+      return false;
+    }
+    const r = el.getBoundingClientRect();
+    if (r.width <= 14 || r.height <= 14) {
+      return false;
+    }
+    const meta = `${el.placeholder || ''} ${el.name || ''} ${el.id || ''}`.toLowerCase();
+    if (
+      meta.includes('search') ||
+      meta.includes('code') ||
+      meta.includes('pin') ||
+      meta.includes('name') ||
+      meta.includes('nick')
+    ) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function detectBlankLengthHint(
+  inputs: Array<HTMLInputElement | HTMLTextAreaElement>
+): number | undefined {
+  if (
+    inputs.length > 1 &&
+    inputs.every(
+      (inp) =>
+        inp instanceof HTMLInputElement &&
+        (inp.maxLength === 1 ||
+          inp.classList.contains('box-input') ||
+          (inp.getAttribute('data-cy') ?? '').startsWith('box'))
+    )
+  ) {
+    return inputs.length;
+  }
+  return undefined;
+}
+
+function detectQuestionStemHasImage(): boolean {
+  if (!IS_WAYGROUND) {
+    return false;
+  }
+  const imgs = Array.from(
+    document.querySelectorAll<HTMLImageElement>(
+      WAYGROUND_SELECTORS.QUESTION_MEDIA_IMG
+    )
+  );
+  return imgs.some((img) => {
+    const r = img.getBoundingClientRect();
+    return Boolean(img.src) && r.width > 48 && r.height > 36;
+  });
+}
+
+function isVisibleMultiSelectSubmitPresent(): boolean {
+  if (IS_WAYGROUND) {
+    const options = getVisibleAnswerButtons();
+    if (options.length < 2) {
+      return false;
+    }
+    const hasCheckboxSemantics = options.some(
+      (opt) =>
+        opt.getAttribute('role') === 'checkbox' ||
+        opt.hasAttribute('aria-checked') ||
+        opt.querySelector('[role="checkbox"], input[type="checkbox"]') !== null
+    );
+    if (hasCheckboxSemantics) {
+      return true;
+    }
+    const submits = Array.from(
+      document.querySelectorAll<HTMLElement>(WAYGROUND_SELECTORS.SUBMIT_BUTTON)
+    );
+    const hasVisibleSubmit = submits.some((el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 8 && rect.height > 8;
+    });
+    if (hasVisibleSubmit) {
+      return true;
+    }
+    return false;
+  }
+
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLElement>(SELECTORS.MULTI_SELECT_SUBMIT)
+  );
+  return candidates.some((el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 8 && rect.height > 8;
+  });
+}
+
+function parseDomQuestionCounter(): number | null {
+  const selector = IS_WAYGROUND
+    ? WAYGROUND_SELECTORS.QUESTION_COUNTER
+    : SELECTORS.QUESTION_COUNTER;
+  const counterEl = document.querySelector<HTMLElement>(selector);
+  if (!counterEl) {
+    return null;
+  }
+  const text = counterEl.textContent?.trim() ?? '';
+  const match = text.match(/(\d+)\s*(?:\/|of)\s*\d+/i) ?? text.match(/^(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  const oneBased = Number.parseInt(match[1], 10);
+  return Number.isFinite(oneBased) && oneBased >= 1 ? oneBased - 1 : null;
+}
+
+function detectDomQuestionTimerMs(): number | null {
+  const selector = IS_WAYGROUND
+    ? WAYGROUND_SELECTORS.QUESTION_TIMER
+    : SELECTORS.QUESTION_TIMER;
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>(selector));
+  for (const el of candidates) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 4 || rect.height <= 4) {
+      continue;
+    }
+    const text = (el.textContent ?? '').trim();
+    const mmss = text.match(/^(\d{1,2}):(\d{2})$/);
+    if (mmss) {
+      const totalSec =
+        Number.parseInt(mmss[1], 10) * 60 + Number.parseInt(mmss[2], 10);
+      if (totalSec >= 4 && totalSec <= 240) {
+        return snapCountdownSecondsToTimerMs(totalSec);
+      }
+    }
+    const secMatch = text.match(/^(\d{1,3})s?$/i);
+    if (secMatch) {
+      const seconds = Number.parseInt(secMatch[1], 10);
+      if (Number.isFinite(seconds) && seconds >= 4 && seconds <= 240) {
+        return snapCountdownSecondsToTimerMs(seconds);
+      }
+    }
+  }
+  return null;
+}
+
 function resolveClickableButton(rawTarget: HTMLElement): HTMLElement {
   if (rawTarget.tagName.toLowerCase() === 'button') {
     return rawTarget;
   }
   const innerBtn = rawTarget.querySelector<HTMLElement>(
-    'button, [role="button"]'
+    'button, [role="button"], [role="option"], [role="checkbox"]'
   );
   if (innerBtn) {
     const r = innerBtn.getBoundingClientRect();
@@ -263,11 +497,13 @@ function resolveClickableButton(rawTarget: HTMLElement): HTMLElement {
       return innerBtn;
     }
   }
-  const ancestorBtn = rawTarget.closest<HTMLElement>('button, [role="button"]');
-  if (
-    ancestorBtn &&
-    ancestorBtn.querySelectorAll(SELECTORS.ANSWER_PREFIX).length <= 1
-  ) {
+  const ancestorBtn = rawTarget.closest<HTMLElement>(
+    'button, [role="button"], [role="option"]'
+  );
+  const guardSel = IS_WAYGROUND
+    ? WAYGROUND_SELECTORS.ALL_OPTION_CANDIDATES
+    : SELECTORS.ANSWER_PREFIX;
+  if (ancestorBtn && ancestorBtn.querySelectorAll(guardSel).length <= 1) {
     return ancestorBtn;
   }
   return rawTarget;
@@ -297,6 +533,24 @@ function isElementInteractive(element: HTMLElement): boolean {
 
 function extractCleanVisibleText(rootEl: HTMLElement): string {
   const clone = rootEl.cloneNode(true) as HTMLElement;
+
+  clone.querySelectorAll('.katex').forEach((katexNode) => {
+    const texAnnotation = katexNode.querySelector(
+      'annotation[encoding="application/x-tex"]'
+    );
+    const tex = texAnnotation?.textContent?.trim();
+    if (tex) {
+      katexNode.replaceWith(document.createTextNode(` ${tex} `));
+    }
+  });
+
+  clone.querySelectorAll('mjx-container[aria-label]').forEach((mjxNode) => {
+    const label = mjxNode.getAttribute('aria-label')?.trim();
+    if (label) {
+      mjxNode.replaceWith(document.createTextNode(` ${label} `));
+    }
+  });
+
   clone
     .querySelectorAll('svg, style, script, noscript, [aria-hidden="true"]')
     .forEach((node) => node.remove());
@@ -305,50 +559,73 @@ function extractCleanVisibleText(rootEl: HTMLElement): string {
 
 function extractOptionTextsFromDom(buttons: HTMLElement[]): string[] {
   return buttons.map((button, idx) => {
-    const dedicatedTextEl =
-      button.querySelector<HTMLElement>(SELECTORS.CHOICE_TEXT_BY_INDEX(idx)) ??
-      document.querySelector<HTMLElement>(SELECTORS.CHOICE_TEXT_BY_INDEX(idx));
-    if (dedicatedTextEl) {
-      const dedicatedClean = extractCleanVisibleText(dedicatedTextEl);
-      if (dedicatedClean.length > 0) {
-        return dedicatedClean;
+    if (!IS_WAYGROUND) {
+      const dedicatedTextEl =
+        button.querySelector<HTMLElement>(SELECTORS.CHOICE_TEXT_BY_INDEX(idx)) ??
+        document.querySelector<HTMLElement>(SELECTORS.CHOICE_TEXT_BY_INDEX(idx));
+      if (dedicatedTextEl) {
+        const dedicatedClean = extractCleanVisibleText(dedicatedTextEl);
+        if (dedicatedClean.length > 0) {
+          return dedicatedClean;
+        }
+      }
+    } else {
+      const wgTextEl = button.querySelector<HTMLElement>(
+        '[data-testid="option-text"], [data-cy="option-text"], .option-text, .resizeable-text'
+      );
+      if (wgTextEl) {
+        const wgClean = extractCleanVisibleText(wgTextEl);
+        if (wgClean.length > 0) {
+          return wgClean;
+        }
       }
     }
     return extractCleanVisibleText(button);
   });
 }
 
-function extractQuestionTitleFromDom(buttons: HTMLElement[]): string {
-  const primaryTitleEl = document.querySelector<HTMLElement>(
-    SELECTORS.QUESTION_TITLE
+function extractQuestionTitleFromDom(anchorNodes: HTMLElement[]): string {
+  const titleSelector = IS_WAYGROUND
+    ? WAYGROUND_SELECTORS.QUESTION_TITLE
+    : SELECTORS.QUESTION_TITLE;
+  const primaryTitleNodes = Array.from(
+    document.querySelectorAll<HTMLElement>(titleSelector)
   );
-  if (primaryTitleEl) {
-    const cleanPrimary = extractCleanVisibleText(primaryTitleEl);
+  for (const node of primaryTitleNodes) {
+    const r = node.getBoundingClientRect();
+    if (r.width <= 8 || r.height <= 6) {
+      continue;
+    }
+    const cleanPrimary = extractCleanVisibleText(node);
     if (cleanPrimary.length > 0) {
       return cleanPrimary;
     }
   }
 
-  if (buttons.length === 0) {
+  if (anchorNodes.length === 0) {
     return '';
   }
 
-  const firstButtonTop = buttons[0].getBoundingClientRect().top;
+  const firstAnchorTop = anchorNodes[0].getBoundingClientRect().top;
   const headingCandidates = Array.from(
     document.querySelectorAll<HTMLElement>(
-      'h1, h2, [role="heading"], [data-functional-selector*="question"]'
+      'h1, h2, [role="heading"], [data-functional-selector*="question"], [data-testid*="question"]'
     )
   );
 
   for (const candidate of headingCandidates) {
-    if (buttons.some((btn) => btn.contains(candidate) || candidate.contains(btn))) {
+    if (
+      anchorNodes.some(
+        (node) => node.contains(candidate) || candidate.contains(node)
+      )
+    ) {
       continue;
     }
     const rect = candidate.getBoundingClientRect();
     if (rect.width <= 10 || rect.height <= 8) {
       continue;
     }
-    if (rect.bottom > firstButtonTop + 32) {
+    if (rect.bottom > firstAnchorTop + 40) {
       continue;
     }
     const text = extractCleanVisibleText(candidate);
@@ -392,15 +669,33 @@ function extractHostChoiceTexts(): string[] {
 }
 
 function clearAllAnswerHighlights(): void {
-  const allButtons = document.querySelectorAll<HTMLElement>(
-    SELECTORS.ANSWER_PREFIX
-  );
-  allButtons.forEach((btn) => {
+  const buttonSel = IS_WAYGROUND
+    ? WAYGROUND_SELECTORS.ALL_OPTION_CANDIDATES
+    : SELECTORS.ANSWER_PREFIX;
+  document.querySelectorAll<HTMLElement>(buttonSel).forEach((btn) => {
     if (btn.style.outline) {
       btn.style.outline = '';
       btn.style.outlineOffset = '';
     }
   });
+
+  if (IS_WAYGROUND) {
+    document
+      .querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+        WAYGROUND_SELECTORS.BLANK_INPUTS + ', input[data-hybrid-orig-ph]'
+      )
+      .forEach((inp) => {
+        if (inp.style.outline) {
+          inp.style.outline = '';
+          inp.style.outlineOffset = '';
+        }
+        const origPh = inp.getAttribute('data-hybrid-orig-ph');
+        if (origPh !== null) {
+          inp.placeholder = origPh;
+          inp.removeAttribute('data-hybrid-orig-ph');
+        }
+      });
+  }
 }
 
 function applyHighlightToTargets(indices: number[]): boolean {
@@ -412,9 +707,10 @@ function applyHighlightToTargets(indices: number[]): boolean {
     }
   }
 
-  const allButtons = document.querySelectorAll<HTMLElement>(
-    SELECTORS.ANSWER_PREFIX
-  );
+  const allButtons = IS_WAYGROUND
+    ? getVisibleAnswerButtons()
+    : Array.from(document.querySelectorAll<HTMLElement>(SELECTORS.ANSWER_PREFIX));
+
   allButtons.forEach((btn) => {
     if (!wantedButtons.has(btn) && btn.style.outline) {
       btn.style.outline = '';
@@ -430,6 +726,32 @@ function applyHighlightToTargets(indices: number[]): boolean {
   }
 
   return wantedButtons.size > 0;
+}
+
+function applyHighlightToBlankInputs(
+  inputs: Array<HTMLInputElement | HTMLTextAreaElement>,
+  fillText: string
+): boolean {
+  if (inputs.length === 0) {
+    return false;
+  }
+  for (const inp of inputs) {
+    if (inp.style.outline !== HIGHLIGHT_OUTLINE_CSS) {
+      inp.style.outline = HIGHLIGHT_OUTLINE_CSS;
+      inp.style.outlineOffset = '-1px';
+    }
+  }
+  if (inputs.length === 1 && fillText) {
+    const single = inputs[0];
+    if (!single.hasAttribute('data-hybrid-orig-ph')) {
+      single.setAttribute('data-hybrid-orig-ph', single.placeholder || '');
+    }
+    const hintText = `Answer: ${fillText}`;
+    if (single.placeholder !== hintText) {
+      single.placeholder = hintText;
+    }
+  }
+  return true;
 }
 
 function dispatchIsolatedMouseAndClick(rawTarget: HTMLElement): void {
@@ -492,7 +814,9 @@ function dispatchIsolatedMouseAndClick(rawTarget: HTMLElement): void {
 
 function postMainWorldClickCommand(
   indices: number[],
-  submitMultiSelect = false
+  submitMultiSelect = false,
+  fillText?: string,
+  autoSubmit = true
 ): boolean {
   const mainBridgeVersion = document.documentElement?.getAttribute(
     'data-kahoot-hybrid-main'
@@ -505,6 +829,8 @@ function postMainWorldClickCommand(
     type: 'EXEC_MAIN_WORLD_CLICK',
     indices,
     submitMultiSelect,
+    fillText,
+    autoSubmit,
   };
   window.postMessage(command, '*');
   return true;
@@ -540,19 +866,44 @@ async function requestServiceWorkerTrustedClick(
   }
 }
 
+async function requestServiceWorkerTrustedTextFill(
+  fillText: string,
+  stateHash?: string
+): Promise<void> {
+  const res = await sendRuntimeMessage<RuntimeClickResponse>({
+    type: 'EXEC_DIRECT_TEXT_FILL',
+    fillText,
+    autoSubmit: true,
+  });
+  if (res && !res.ok) {
+    if (res.error && stateHash && shownDebuggerWarningHash !== stateHash) {
+      shownDebuggerWarningHash = stateHash;
+      showHudToast(`⚡ ${res.error}`, true, 4500);
+    }
+    postMainWorldClickCommand([], false, fillText, true);
+  }
+}
+
 function hasChoiceAcceptedState(element: HTMLElement): boolean {
   const clickable = resolveClickableButton(element);
+  const cls = `${element.className || ''} ${clickable.className || ''}`.toLowerCase();
   if (
     element.getAttribute('aria-pressed') === 'true' ||
     clickable.getAttribute('aria-pressed') === 'true' ||
     element.getAttribute('aria-checked') === 'true' ||
     clickable.getAttribute('aria-checked') === 'true' ||
+    element.getAttribute('aria-selected') === 'true' ||
+    clickable.getAttribute('aria-selected') === 'true' ||
     element.getAttribute('data-selected') === 'true' ||
-    clickable.getAttribute('data-selected') === 'true'
+    clickable.getAttribute('data-selected') === 'true' ||
+    /\bselected\b/.test(cls)
   ) {
     return true;
   }
-  return document.querySelector(SELECTORS.POST_SUBMIT_INDICATORS) !== null;
+  const postSel = IS_WAYGROUND
+    ? WAYGROUND_SELECTORS.POST_SUBMIT_INDICATORS
+    : SELECTORS.POST_SUBMIT_INDICATORS;
+  return document.querySelector(postSel) !== null;
 }
 
 function startSingleSelectVerificationLoop(resolution: AnswerResolution): void {
@@ -583,7 +934,7 @@ function startSingleSelectVerificationLoop(resolution: AnswerResolution): void {
       return;
     }
 
-    if (clickVerifyAttempts >= 100) {
+    if (clickVerifyAttempts >= (IS_WAYGROUND ? 12 : 100)) {
       return;
     }
 
@@ -596,10 +947,10 @@ function startSingleSelectVerificationLoop(resolution: AnswerResolution): void {
       resolution.stateHash
     );
 
-    clickVerifyTimer = setTimeout(verifyStep, 220);
+    clickVerifyTimer = setTimeout(verifyStep, 240);
   };
 
-  clickVerifyTimer = setTimeout(verifyStep, 220);
+  clickVerifyTimer = setTimeout(verifyStep, 240);
 }
 
 function startMultiSelectSubmitVerification(resolution: AnswerResolution): void {
@@ -615,9 +966,13 @@ function startMultiSelectSubmitVerification(resolution: AnswerResolution): void 
       return;
     }
 
+    const postSel = IS_WAYGROUND
+      ? WAYGROUND_SELECTORS.POST_SUBMIT_INDICATORS
+      : SELECTORS.POST_SUBMIT_INDICATORS;
+
     if (
       !isVisibleMultiSelectSubmitPresent() ||
-      document.querySelector(SELECTORS.POST_SUBMIT_INDICATORS) !== null
+      document.querySelector(postSel) !== null
     ) {
       return;
     }
@@ -633,13 +988,51 @@ function startMultiSelectSubmitVerification(resolution: AnswerResolution): void 
       true,
       resolution.stateHash
     );
-    clickVerifyTimer = setTimeout(verifySubmitStep, 240);
+    clickVerifyTimer = setTimeout(verifySubmitStep, 250);
   };
 
-  clickVerifyTimer = setTimeout(verifySubmitStep, 240);
+  clickVerifyTimer = setTimeout(verifySubmitStep, 250);
+}
+
+function executeAutoFillSequence(resolution: AnswerResolution): boolean {
+  const fillText = (resolution.fillText ?? '').trim();
+  if (!fillText) {
+    return false;
+  }
+  const blankInputs = getVisibleBlankInputs();
+  if (blankInputs.length === 0) {
+    return false;
+  }
+
+  void requestServiceWorkerTrustedTextFill(fillText, resolution.stateHash);
+
+  clearClickVerifyTimer();
+  clickVerifyTimer = setTimeout(() => {
+    clickVerifyTimer = null;
+    if (
+      !currentSettings.enabled ||
+      currentSettings.triggerMode === 'highlight_only' ||
+      activeRoundResolution?.stateHash !== resolution.stateHash
+    ) {
+      return;
+    }
+    const recheck = getVisibleBlankInputs();
+    if (
+      recheck.length > 0 &&
+      recheck.every((inp) => inp.value.trim().length === 0)
+    ) {
+      void requestServiceWorkerTrustedTextFill(fillText, resolution.stateHash);
+    }
+  }, 320);
+
+  return true;
 }
 
 function executeAutoClickSequence(resolution: AnswerResolution): boolean {
+  if (resolution.questionKind === 'fill_blank') {
+    return executeAutoFillSequence(resolution);
+  }
+
   const targets: HTMLElement[] = [];
   for (const idx of resolution.indices) {
     const btn = findVisibleAnswerButton(idx);
@@ -745,6 +1138,100 @@ function tryCommitResolutionToDom(resolution: AnswerResolution): void {
   syncSettingsFromResolution(resolution);
   activeRoundResolution = resolution;
   if (!currentSettings.enabled) {
+    return;
+  }
+
+  if (resolution.questionKind === 'fill_blank') {
+    const blankInputs = getVisibleBlankInputs();
+    if (blankInputs.length === 0) {
+      pendingResolution = resolution;
+      schedulePendingCommitRetry();
+      return;
+    }
+
+    if (
+      applyHighlightToBlankInputs(blankInputs, resolution.fillText ?? '')
+    ) {
+      highlightedStateHash = resolution.stateHash;
+    }
+
+    if (currentSettings.triggerMode === 'highlight_only') {
+      lastScheduledWaitMs = 0;
+      pendingResolution = null;
+      pendingCommitAttempts = 0;
+      return;
+    }
+
+    if (clickedStateHash === resolution.stateHash) {
+      pendingResolution = null;
+      pendingCommitAttempts = 0;
+      return;
+    }
+
+    if (readyButtonsPerfTimestamp <= 0) {
+      readyButtonsPerfTimestamp = performance.now();
+      const domTimer = detectDomQuestionTimerMs();
+      if (domTimer !== null) {
+        currentQuestionTimerMs = domTimer;
+      }
+    }
+
+    pendingResolution = null;
+    pendingCommitAttempts = 0;
+
+    if (currentSettings.triggerMode === 'instant_auto_click') {
+      lastScheduledWaitMs = 0;
+      if (executeAutoFillSequence(resolution)) {
+        clickedStateHash = resolution.stateHash;
+      }
+      return;
+    }
+
+    if (scheduledJitterTimer !== null) {
+      return;
+    }
+
+    const elapsedFill =
+      readyButtonsPerfTimestamp > 0
+        ? Math.max(0, performance.now() - readyButtonsPerfTimestamp)
+        : 0;
+    const waitFillMs =
+      currentSettings.triggerMode === 'target_score'
+        ? computeTargetScoreDelayMs(
+            currentSettings.targetScore,
+            currentQuestionTimerMs,
+            elapsedFill
+          )
+        : Math.round(
+            Math.max(
+              0,
+              currentSettings.minDelayMs +
+                Math.random() *
+                  Math.max(
+                    0,
+                    currentSettings.maxDelayMs - currentSettings.minDelayMs
+                  ) -
+                elapsedFill
+            )
+          );
+
+    lastScheduledWaitMs = waitFillMs;
+    if (waitFillMs <= 15) {
+      if (executeAutoFillSequence(resolution)) {
+        clickedStateHash = resolution.stateHash;
+      }
+      return;
+    }
+
+    scheduledJitterTimer = setTimeout(() => {
+      scheduledJitterTimer = null;
+      if (!currentSettings.enabled || clickedStateHash === resolution.stateHash) {
+        return;
+      }
+      if (executeAutoFillSequence(resolution)) {
+        clickedStateHash = resolution.stateHash;
+      }
+    }, waitFillMs);
     return;
   }
 
@@ -872,10 +1359,15 @@ function formatResolutionHudToast(
     ? `${prefix} (${formatModeLabel(effectiveMode)})`
     : formatModeLabel(effectiveMode);
 
+  const answerDisplay =
+    res.questionKind === 'fill_blank' && res.fillText
+      ? `"${res.fillText.length > 28 ? res.fillText.slice(0, 28) + '…' : res.fillText}"`
+      : `[${res.indices.join(', ')}]`;
+
   if (effectiveMode === 'target_score' && lastScheduledWaitMs > 20) {
-    return `⚡ ${label} → [${res.indices.join(', ')}] (click ${(lastScheduledWaitMs / 1000).toFixed(1)}s${voteBadge})`;
+    return `⚡ ${label} → ${answerDisplay} (click ${(lastScheduledWaitMs / 1000).toFixed(1)}s${voteBadge})`;
   }
-  return `⚡ ${label} → [${res.indices.join(', ')}] (${res.latencyMs}ms${voteBadge})`;
+  return `⚡ ${label} → ${answerDisplay} (${res.latencyMs}ms${voteBadge})`;
 }
 
 function showHudToast(message: string, isError = false, durationMs = 2600): void {
@@ -974,20 +1466,22 @@ async function dispatchHostBroadcastOrVisionFallback(
   }
   triggeredVisionRounds.add(roundIndex);
 
-  const broadcastCheck = await sendRuntimeMessage<RuntimeResolveResponse>({
-    type: 'QUERY_HOST_BROADCAST',
-  });
-  if (
-    broadcastCheck &&
-    broadcastCheck.ok &&
-    broadcastCheck.resolution &&
-    !appliedBroadcastHashes.has(broadcastCheck.resolution.stateHash)
-  ) {
-    const res = broadcastCheck.resolution;
-    appliedBroadcastHashes.add(res.stateHash);
-    tryCommitResolutionToDom(res);
-    showHudToast(formatResolutionHudToast(res, 'Synced'));
-    return;
+  if (!IS_WAYGROUND) {
+    const broadcastCheck = await sendRuntimeMessage<RuntimeResolveResponse>({
+      type: 'QUERY_HOST_BROADCAST',
+    });
+    if (
+      broadcastCheck &&
+      broadcastCheck.ok &&
+      broadcastCheck.resolution &&
+      !appliedBroadcastHashes.has(broadcastCheck.resolution.stateHash)
+    ) {
+      const res = broadcastCheck.resolution;
+      appliedBroadcastHashes.add(res.stateHash);
+      tryCommitResolutionToDom(res);
+      showHudToast(formatResolutionHudToast(res, 'Synced'));
+      return;
+    }
   }
 
   if (
@@ -1083,6 +1577,8 @@ async function tryBroadcastHostScreenQuestion(): Promise<void> {
       multiSelect: false,
       optionCount: hostChoices.length,
       source: 'dom',
+      platform: 'kahoot',
+      questionKind: 'choice',
     },
   });
 
@@ -1152,6 +1648,8 @@ function handleWebSocketQuestionSignal(signal: WsQuestionSignal): void {
       multiSelect: signal.multiSelect,
       optionCount: signal.optionCount,
       source: 'websocket',
+      platform: 'kahoot',
+      questionKind: 'choice',
     };
 
     if (isHostTab && getVisibleAnswerButtons().length === 0) {
@@ -1195,10 +1693,14 @@ function checkUrlNavigationAndWarmup(): void {
   lastObservedHref = currentHref;
 
   if (
-    currentHref.includes('/join') ||
+    currentHref.includes('/join/pre-game') ||
+    currentHref.includes('/join/lobby') ||
+    currentHref.includes('/join/game-over') ||
+    currentHref.includes('/join/summary') ||
     currentHref.includes('/instructions') ||
     currentHref.includes('/v2/lobby') ||
-    currentHref.includes('/gameover')
+    currentHref.includes('/gameover') ||
+    (!IS_WAYGROUND && currentHref.includes('/join'))
   ) {
     resetSessionDeduplication();
   }
@@ -1207,7 +1709,8 @@ function checkUrlNavigationAndWarmup(): void {
     currentHref.includes('play.kahoot.it/v2/lobby') ||
     currentHref.includes('kahoot.it/instructions') ||
     currentHref.includes('kahoot.it/join') ||
-    currentHref.includes('kahoot.it/getready')
+    currentHref.includes('kahoot.it/getready') ||
+    (IS_WAYGROUND && isActiveWaygroundQuestionRoute())
   ) {
     void sendRuntimeMessage<{ ok: boolean }>({ type: 'WARMUP_CONNECTIONS' });
   }
@@ -1227,25 +1730,142 @@ function evaluateDomState(): void {
   }
 
   const buttons = getVisibleAnswerButtons();
+  const blankInputs = buttons.length === 0 ? getVisibleBlankInputs() : [];
+  const hasInteractiveSurface = buttons.length > 0 || blankInputs.length > 0;
 
-  if (buttons.length === 0) {
+  if (!hasInteractiveSurface) {
     if (buttonsMounted) {
       buttonsMounted = false;
-      readyButtonsPerfTimestamp = 0;
-      currentQuestionTimerMs = DEFAULT_QUESTION_TIMER_MS;
-      wsTimerCapturedForRound = false;
-      lastScheduledWaitMs = 0;
+      activeDomRoundSignature = null;
       currentQuestionIndex = -1;
       syntheticRoundCounter += 1;
-      pendingResolution = null;
-      activeRoundResolution = null;
-      pendingCommitAttempts = 0;
-      highlightedStateHash = null;
-      clickedStateHash = null;
+      resetPerRoundDomState();
       clearScheduledTimers();
     }
     void tryBroadcastHostScreenQuestion();
     return;
+  }
+
+  if (blankInputs.length > 0) {
+    const fibQuestionText = extractQuestionTitleFromDom(blankInputs);
+    const fibHasImage = detectQuestionStemHasImage();
+    const blankLengthHint = detectBlankLengthHint(blankInputs);
+    const liveFibSig =
+      fibQuestionText.length > 0
+        ? buildContentSignature(`fib::${fibQuestionText}`, [
+            String(blankLengthHint ?? 0),
+          ])
+        : null;
+
+    if (
+      liveFibSig &&
+      activeDomRoundSignature &&
+      liveFibSig !== activeDomRoundSignature
+    ) {
+      syntheticRoundCounter += 1;
+      currentQuestionIndex = parseDomQuestionCounter() ?? syntheticRoundCounter;
+      resetPerRoundDomState();
+      clearAllAnswerHighlights();
+    }
+    if (liveFibSig) {
+      activeDomRoundSignature = liveFibSig;
+    }
+
+    if (!buttonsMounted) {
+      buttonsMounted = true;
+      currentQuestionIndex = parseDomQuestionCounter() ?? syntheticRoundCounter;
+    }
+
+    if (readyButtonsPerfTimestamp <= 0) {
+      readyButtonsPerfTimestamp = performance.now();
+      const domTimer = detectDomQuestionTimerMs();
+      if (domTimer !== null) {
+        currentQuestionTimerMs = domTimer;
+      }
+    }
+
+    if (pendingResolution) {
+      tryCommitResolutionToDom(pendingResolution);
+      return;
+    }
+
+    if (highlightedStateHash !== null) {
+      if (
+        activeRoundResolution &&
+        currentSettings.triggerMode !== 'highlight_only' &&
+        scheduledJitterTimer === null &&
+        clickedStateHash !== activeRoundResolution.stateHash
+      ) {
+        tryCommitResolutionToDom({
+          ...activeRoundResolution,
+          triggerMode: currentSettings.triggerMode,
+        });
+      }
+      return;
+    }
+
+    if (fibQuestionText.length > 0 || fibHasImage) {
+      const roundIdx =
+        currentQuestionIndex >= 0 ? currentQuestionIndex : syntheticRoundCounter;
+      const sigKey =
+        liveFibSig ?? `fib-img-${roundIdx}-${blankInputs.length}`;
+      const stateHash = buildQuestionStateHash(
+        roundIdx,
+        `fib::${fibQuestionText}`,
+        [String(blankLengthHint ?? 0)],
+        fibHasImage && !fibQuestionText ? 'vision' : 'text'
+      );
+
+      if (
+        triggeredContentSignatures.has(sigKey) ||
+        triggeredStateHashes.has(stateHash)
+      ) {
+        return;
+      }
+      triggeredContentSignatures.add(sigKey);
+      triggeredStateHashes.add(stateHash);
+
+      void dispatchResolutionRequest(
+        {
+          stateHash,
+          questionIndex: roundIdx,
+          questionText: fibQuestionText,
+          options: [],
+          multiSelect: false,
+          optionCount: 0,
+          source: 'dom',
+          platform: PLATFORM,
+          questionKind: 'fill_blank',
+          blankLengthHint,
+          hasQuestionImage: fibHasImage,
+        },
+        sigKey
+      );
+    }
+    return;
+  }
+
+  const questionText = extractQuestionTitleFromDom(buttons);
+  const rawOptionTexts = extractOptionTextsFromDom(buttons);
+  const hasOptionStrings = rawOptionTexts.some((txt) => txt.length > 0);
+  const liveChoiceSig =
+    questionText.length > 0 && hasOptionStrings
+      ? buildContentSignature(questionText, rawOptionTexts)
+      : null;
+
+  if (
+    IS_WAYGROUND &&
+    liveChoiceSig &&
+    activeDomRoundSignature &&
+    liveChoiceSig !== activeDomRoundSignature
+  ) {
+    syntheticRoundCounter += 1;
+    currentQuestionIndex = parseDomQuestionCounter() ?? syntheticRoundCounter;
+    resetPerRoundDomState();
+    clearAllAnswerHighlights();
+  }
+  if (liveChoiceSig) {
+    activeDomRoundSignature = liveChoiceSig;
   }
 
   if (!buttonsMounted) {
@@ -1296,10 +1916,8 @@ function evaluateDomState(): void {
     return;
   }
 
-  const questionText = extractQuestionTitleFromDom(buttons);
-  const rawOptionTexts = extractOptionTextsFromDom(buttons);
-  const hasOptionStrings = rawOptionTexts.some((txt) => txt.length > 0);
   const multiSelect = isVisibleMultiSelectSubmitPresent();
+  const hasQuestionImage = detectQuestionStemHasImage();
 
   const roundIndex =
     currentQuestionIndex >= 0 ? currentQuestionIndex : syntheticRoundCounter;
@@ -1310,13 +1928,19 @@ function evaluateDomState(): void {
       ? ['True', 'False']
       : [];
 
-  if (questionText.length > 0 && effectiveOptions.length >= 2) {
-    const contentSig = buildContentSignature(questionText, effectiveOptions);
+  if (
+    (questionText.length > 0 && effectiveOptions.length >= 2) ||
+    (IS_WAYGROUND && hasQuestionImage && buttons.length >= 2)
+  ) {
+    const contentSig = buildContentSignature(
+      questionText || `wg-img-${roundIndex}`,
+      effectiveOptions
+    );
     const stateHash = buildQuestionStateHash(
       roundIndex,
-      questionText,
+      questionText || `wg-img-${roundIndex}`,
       effectiveOptions,
-      'text'
+      hasQuestionImage && !questionText ? 'vision' : 'text'
     );
 
     if (
@@ -1338,6 +1962,9 @@ function evaluateDomState(): void {
         multiSelect,
         optionCount: buttons.length,
         source: 'dom',
+        platform: PLATFORM,
+        questionKind: 'choice',
+        hasQuestionImage,
       },
       contentSig
     );
@@ -1391,6 +2018,7 @@ function scheduleDomEvaluation(): void {
 
 async function hydrateInitialSettings(): Promise<void> {
   currentSettings = await loadSettings();
+  syncWaygroundFocusGuardAttribute();
   if (currentSettings.enabled) {
     void sendRuntimeMessage<{ ok: boolean }>({ type: 'WARMUP_CONNECTIONS' });
   }
@@ -1512,6 +2140,8 @@ async function handleDirectPasteSolve(event: ClipboardEvent): Promise<void> {
   }
 
   const buttons = getVisibleAnswerButtons();
+  const blankInputs = buttons.length === 0 ? getVisibleBlankInputs() : [];
+  const isFill = blankInputs.length > 0;
   const stateHash = buildQuestionStateHash(
     Date.now(),
     'direct-paste-clipboard',
@@ -1524,6 +2154,8 @@ async function handleDirectPasteSolve(event: ClipboardEvent): Promise<void> {
     questionIndex: currentQuestionIndex,
     optionCount: buttons.length || 4,
     multiSelect: isVisibleMultiSelectSubmitPresent(),
+    questionKind: isFill ? 'fill_blank' : 'choice',
+    blankLengthHint: isFill ? detectBlankLengthHint(blankInputs) : undefined,
     clipboard: extractedPayload,
   });
 
@@ -1538,6 +2170,8 @@ async function handleDirectPasteSolve(event: ClipboardEvent): Promise<void> {
 async function triggerShortcutClipboardSolve(): Promise<void> {
   showHudToast('⚡ Solving from Clipboard...');
   const buttons = getVisibleAnswerButtons();
+  const blankInputs = buttons.length === 0 ? getVisibleBlankInputs() : [];
+  const isFill = blankInputs.length > 0;
   const stateHash = buildQuestionStateHash(
     Date.now(),
     'shortcut-keydown-clipboard',
@@ -1550,6 +2184,8 @@ async function triggerShortcutClipboardSolve(): Promise<void> {
     questionIndex: currentQuestionIndex,
     optionCount: buttons.length || 4,
     multiSelect: isVisibleMultiSelectSubmitPresent(),
+    questionKind: isFill ? 'fill_blank' : 'choice',
+    blankLengthHint: isFill ? detectBlankLengthHint(blankInputs) : undefined,
   });
 
   if (res && res.ok && res.resolution) {
@@ -1563,6 +2199,8 @@ async function triggerShortcutClipboardSolve(): Promise<void> {
 async function triggerShortcutVisionCapture(): Promise<void> {
   showHudToast('⚡ Capturing Tab Vision...');
   const buttons = getVisibleAnswerButtons();
+  const blankInputs = buttons.length === 0 ? getVisibleBlankInputs() : [];
+  const isFill = blankInputs.length > 0;
   const manualHash = buildQuestionStateHash(
     Date.now(),
     'shortcut-keydown-vision',
@@ -1575,6 +2213,8 @@ async function triggerShortcutVisionCapture(): Promise<void> {
     questionIndex: currentQuestionIndex,
     optionCount: buttons.length || 4,
     multiSelect: isVisibleMultiSelectSubmitPresent(),
+    questionKind: isFill ? 'fill_blank' : 'choice',
+    blankLengthHint: isFill ? detectBlankLengthHint(blankInputs) : undefined,
   });
   if (res && res.ok && res.resolution) {
     tryCommitResolutionToDom(res.resolution);
@@ -1597,8 +2237,7 @@ function initializeIsolatedContentEngine(): void {
     if (
       currentSettings.enabled &&
       document.visibilityState === 'visible' &&
-      (window.location.hostname === 'kahoot.it' ||
-        window.location.hostname === 'play.kahoot.it')
+      (isKahootHostname(window.location.hostname) || IS_WAYGROUND)
     ) {
       void sendRuntimeMessage<{ ok: boolean }>({ type: 'WARMUP_CONNECTIONS' });
     }
@@ -1611,6 +2250,7 @@ function initializeIsolatedContentEngine(): void {
       const next = changes[STORAGE_KEYS.SETTINGS]
         .newValue as EngineSettings;
       currentSettings = next;
+      syncWaygroundFocusGuardAttribute();
       if (!next.enabled) {
         clearScheduledTimers();
         requestAnimationFrame(clearAllAnswerHighlights);
@@ -1750,6 +2390,7 @@ function initializeIsolatedContentEngine(): void {
   domObserver = observer;
 
   const attachObserver = (): void => {
+    syncWaygroundFocusGuardAttribute();
     const rootNode = document.documentElement ?? document;
     observer.observe(rootNode, {
       childList: true,
@@ -1758,8 +2399,11 @@ function initializeIsolatedContentEngine(): void {
       attributeFilter: [
         'disabled',
         'aria-disabled',
+        'aria-checked',
         'class',
         'data-functional-selector',
+        'data-testid',
+        'data-cy',
       ],
     });
     scheduleDomEvaluation();

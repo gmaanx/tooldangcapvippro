@@ -13,7 +13,7 @@
       <span class="bolt-badge" aria-hidden="true">⚡</span>
       <div>
         <h1>KahootHybridEngine</h1>
-        <p class="subtitle">Multi-AI Consensus &amp; Stealth Score Control</p>
+        <p class="subtitle">Kahoot &amp; Wayground &middot; Multi-AI Consensus</p>
       </div>
     </div>
     <label class="master-toggle" for="engine-enabled">
@@ -41,7 +41,7 @@
     <form id="settings-form" action="#" method="post" novalidate>
       <fieldset class="panel">
         <legend>1. Execution &amp; Point Pacing</legend>
-        <p class="live-ready-note">Keep Chrome's top debugging bar open on <code>kahoot.it</code> so real hardware Auto-Click works.</p>
+        <p class="live-ready-note">Keep Chrome's top debugging bar open on <code>kahoot.it</code> &amp; <code>wayground.com</code> so real hardware Auto-Click &amp; Auto-Type work.</p>
         <div class="radio-group">
           <label class="radio-option" for="mode-instant">
             <input type="radio" id="mode-instant" name="triggerMode" value="instant_auto_click" checked>
@@ -141,6 +141,14 @@
             </div>
           </div>
         </div>
+
+        <label class="checkbox-card focus-guard-card" for="anti-focus-loss">
+          <input type="checkbox" id="anti-focus-loss" name="antiFocusLoss" class="visually-hidden-fallback" checked>
+          <span>
+            <strong>Anti Focus-Loss (Wayground Test Mode)</strong>
+            <small>Blocks tab-switch / blur alerts when opening Popup or snipping screenshots</small>
+          </span>
+        </label>
       </fieldset>
 
       <fieldset class="panel">

@@ -75,9 +75,15 @@ export async function ensureLearnedCacheHydrated(): Promise<void> {
           typeof normQuestion === 'string' &&
           normQuestion.length > 0 &&
           entry &&
-          Array.isArray(entry.indices)
+          (Array.isArray(entry.indices) || typeof entry.fillText === 'string')
         ) {
-          learnedCache.set(normQuestion, entry);
+          learnedCache.set(normQuestion, {
+            choiceTexts: Array.isArray(entry.choiceTexts) ? entry.choiceTexts : [],
+            indices: Array.isArray(entry.indices) ? entry.indices : [],
+            fillText: typeof entry.fillText === 'string' ? entry.fillText : undefined,
+            verified: Boolean(entry.verified),
+            updatedAt: Number(entry.updatedAt) || Date.now(),
+          });
         }
       }
     }
@@ -142,14 +148,34 @@ export async function lookupLearnedCache(
   return null;
 }
 
+export async function lookupLearnedFillBlank(
+  questionText: string
+): Promise<string | null> {
+  await ensureLearnedCacheHydrated();
+  if (learnedCache.size === 0) {
+    return null;
+  }
+  const normQuestion = normalizeQuestionText(questionText);
+  if (!normQuestion) {
+    return null;
+  }
+  const entry = learnedCache.get(normQuestion);
+  if (entry && typeof entry.fillText === 'string' && entry.fillText.trim().length > 0) {
+    return entry.fillText.trim();
+  }
+  return null;
+}
+
 export async function recordLearnedAnswer(
   questionText: string,
   options: string[],
   indices: number[],
-  verified: boolean
+  verified: boolean,
+  fillText?: string
 ): Promise<void> {
   const normQuestion = normalizeQuestionText(questionText);
-  if (normQuestion.length < 3 || indices.length === 0) {
+  const cleanFill = typeof fillText === 'string' ? fillText.trim() : '';
+  if (normQuestion.length < 3 || (indices.length === 0 && cleanFill.length === 0)) {
     return;
   }
 
@@ -171,11 +197,14 @@ export async function recordLearnedAnswer(
 
   const finalChoiceTexts =
     choiceTexts.length > 0 ? choiceTexts : (existing?.choiceTexts ?? []);
+  const finalFillText =
+    cleanFill.length > 0 ? cleanFill : existing?.fillText;
 
   learnedCache.delete(normQuestion);
   learnedCache.set(normQuestion, {
     choiceTexts: finalChoiceTexts,
     indices: [...indices],
+    fillText: finalFillText,
     verified: verified || Boolean(existing?.verified),
     updatedAt: Date.now(),
   });

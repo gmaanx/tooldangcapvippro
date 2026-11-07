@@ -8,6 +8,7 @@ import {
   computeTargetScoreDelayMs,
   extractGamePin,
   extractUuid,
+  isWaygroundHostname,
 } from '../shared/normalize';
 import { saveSettings } from '../shared/storage';
 import type {
@@ -79,6 +80,22 @@ function describeTriggerMode(mode: TriggerMode, targetScore: number): string {
   return 'Highlight Only';
 }
 
+function isSupportedQuizUrl(rawUrl: string | undefined): boolean {
+  if (!rawUrl) {
+    return false;
+  }
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return (
+      host === 'kahoot.it' ||
+      host === 'play.kahoot.it' ||
+      isWaygroundHostname(host)
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function findPopupTargetKahootTab(): Promise<chrome.tabs.Tab | undefined> {
   const [activeTab] = await chrome.tabs.query({
     active: true,
@@ -87,23 +104,31 @@ async function findPopupTargetKahootTab(): Promise<chrome.tabs.Tab | undefined> 
   if (
     activeTab &&
     typeof activeTab.id === 'number' &&
-    (activeTab.url?.startsWith('https://kahoot.it/') ||
-      activeTab.url?.startsWith('https://play.kahoot.it/'))
+    isSupportedQuizUrl(activeTab.url)
   ) {
     return activeTab;
   }
 
-  const kahootTabs = await chrome.tabs.query({
-    url: ['https://kahoot.it/*', 'https://play.kahoot.it/*'],
+  const quizTabs = await chrome.tabs.query({
+    url: [
+      'https://kahoot.it/*',
+      'https://play.kahoot.it/*',
+      'https://wayground.com/*',
+      'https://*.wayground.com/*',
+      'https://quizizz.com/*',
+      'https://*.quizizz.com/*',
+      'https://joinmyquiz.com/*',
+      'https://*.joinmyquiz.com/*',
+    ],
   });
-  const activeKahootTab = kahootTabs.find(
+  const activeQuizTab = quizTabs.find(
     (tab) => tab.active && typeof tab.id === 'number'
   );
-  if (activeKahootTab) {
-    return activeKahootTab;
+  if (activeQuizTab) {
+    return activeQuizTab;
   }
 
-  return kahootTabs.find((tab) => typeof tab.id === 'number') ?? activeTab;
+  return quizTabs.find((tab) => typeof tab.id === 'number') ?? activeTab;
 }
 
 function syncTargetScoreSliderUi(rawValue?: number): number {
@@ -311,6 +336,8 @@ function populateForm(settings: EngineSettings): void {
   queryRequired<HTMLInputElement>('#engine-enabled').checked = settings.enabled;
   queryRequired<HTMLInputElement>('#consensus-mode').checked =
     settings.consensusMode !== 'fastest_first';
+  queryRequired<HTMLInputElement>('#anti-focus-loss').checked =
+    settings.antiFocusLoss !== false;
   queryRequired<HTMLInputElement>('#quiz-id').value = settings.quizId;
   queryRequired<HTMLInputElement>('#min-delay-ms').value = String(
     settings.minDelayMs
@@ -344,6 +371,8 @@ function readFormSettings(): EngineSettings {
   const consensusMode: ConsensusMode = consensusChecked
     ? 'consensus_vote'
     : 'fastest_first';
+  const antiFocusLoss =
+    queryRequired<HTMLInputElement>('#anti-focus-loss').checked;
   const rawQuizInput = queryRequired<HTMLInputElement>('#quiz-id').value.trim();
   const normalizedIdentifier =
     extractUuid(rawQuizInput) ?? extractGamePin(rawQuizInput) ?? rawQuizInput;
@@ -396,6 +425,7 @@ function readFormSettings(): EngineSettings {
       '#openrouter-api-key'
     ).value.trim(),
     consensusMode,
+    antiFocusLoss,
     pinnedContext: queryRequired<HTMLTextAreaElement>('#pinned-context').value,
     triggerMode,
     targetScore,
@@ -419,6 +449,8 @@ async function initializePopup(): Promise<void> {
   const clipboardNowBtn = queryRequired<HTMLButtonElement>('#clipboard-now-btn');
   const targetScoreSlider = queryRequired<HTMLInputElement>('#target-score');
   const consensusCheckbox = queryRequired<HTMLInputElement>('#consensus-mode');
+  const antiFocusCheckbox =
+    queryRequired<HTMLInputElement>('#anti-focus-loss');
 
   installValidationSync(form);
   bindPasswordToggle('#toggle-groq-key', '#groq-api-key', 'Groq API key');
@@ -485,6 +517,15 @@ async function initializePopup(): Promise<void> {
       consensusCheckbox.checked
         ? 'Multi-AI Consensus Vote enabled (2+ AI vote check).'
         : 'Fastest Single AI mode enabled.'
+    );
+  });
+
+  antiFocusCheckbox.addEventListener('change', async () => {
+    await saveSettings({ antiFocusLoss: antiFocusCheckbox.checked });
+    showStatus(
+      antiFocusCheckbox.checked
+        ? 'Anti Focus-Loss enabled on Wayground.'
+        : 'Anti Focus-Loss disabled.'
     );
   });
 
@@ -586,8 +627,13 @@ async function initializePopup(): Promise<void> {
       if (refreshed?.ok) {
         renderTelemetry(refreshed.telemetry);
       }
+      const summary =
+        result.resolution.questionKind === 'fill_blank' &&
+        result.resolution.fillText
+          ? `"${result.resolution.fillText}"`
+          : `[${result.resolution.indices.join(', ')}]`;
       showStatus(
-        `Vision resolved choice [${result.resolution.indices.join(', ')}] in ${result.resolution.latencyMs}ms.`
+        `Vision resolved ${summary} in ${result.resolution.latencyMs}ms.`
       );
     } else {
       showStatus(result?.error ?? 'Vision capture failed.', true);
@@ -615,6 +661,11 @@ async function initializePopup(): Promise<void> {
     clipboardNowBtn.disabled = false;
 
     if (result && result.ok && result.resolution) {
+      const summary =
+        result.resolution.questionKind === 'fill_blank' &&
+        result.resolution.fillText
+          ? `"${result.resolution.fillText}"`
+          : `[${result.resolution.indices.join(', ')}]`;
       if (targetTab && typeof targetTab.id === 'number') {
         const applyMsg: ContentPushMessage = {
           type: 'APPLY_RESOLVED_ANSWER',
@@ -622,7 +673,7 @@ async function initializePopup(): Promise<void> {
         };
         const toastMsg: ContentPushMessage = {
           type: 'CLIPBOARD_STATUS_TOAST',
-          message: `⚡ Clipboard → [${result.resolution.indices.join(', ')}] (${result.resolution.latencyMs}ms)`,
+          message: `⚡ Clipboard → ${summary} (${result.resolution.latencyMs}ms)`,
         };
         try {
           await chrome.tabs.sendMessage(targetTab.id, applyMsg);
@@ -638,7 +689,7 @@ async function initializePopup(): Promise<void> {
         renderTelemetry(refreshed.telemetry);
       }
       showStatus(
-        `Clipboard resolved choice [${result.resolution.indices.join(', ')}] in ${result.resolution.latencyMs}ms.`
+        `Clipboard resolved ${summary} in ${result.resolution.latencyMs}ms.`
       );
     } else {
       showStatus(result?.error ?? 'Clipboard Vision failed.', true);

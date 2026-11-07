@@ -6,24 +6,34 @@ import {
   VISION_MAX_DIMENSION_PX,
   VISION_WEBP_QUALITY,
 } from '../shared/constants';
-import { parseAnswerIndices } from '../shared/normalize';
+import { parseAnswerIndices, parseFillBlankAnswer } from '../shared/normalize';
 import {
   acquireVisionCaptureLock,
   releaseVisionCaptureLock,
 } from '../shared/storage';
-import type { EngineSettings } from '../shared/types';
+import type { EngineSettings, QuestionKind } from '../shared/types';
 import {
+  buildFillBlankSystemInstruction,
   buildQuizSystemInstruction,
   extractGeminiInteractionText,
   isProviderKeyMuted,
   recordProviderAuthFailure,
   runGroqVisionCompletionWithFallback,
+  runGroqVisionFillBlankWithFallback,
 } from './ai-racer';
 
 export interface VisionResolutionResult {
   indices: number[];
+  fillText?: string;
   latencyMs: number;
   hostOnlyBlank?: boolean;
+}
+
+export interface VisionSolveContext {
+  questionKind?: QuestionKind;
+  blankLengthHint?: number;
+  contextQuestionText?: string;
+  contextOptions?: string[];
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -40,6 +50,38 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 function stripDataUrlPrefix(dataUrl: string): string {
   const commaIndex = dataUrl.indexOf(',');
   return commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : dataUrl;
+}
+
+function formatOrdinal(oneBased: number): string {
+  if (oneBased === 1) return '1st';
+  if (oneBased === 2) return '2nd';
+  if (oneBased === 3) return '3rd';
+  return `${oneBased}th`;
+}
+
+export function buildVisionOptionMappingLines(safeOptionCount: number): string[] {
+  if (safeOptionCount === 2) {
+    return [
+      '0 = 1st option (Left / Top-Left / Blue / True)',
+      '1 = 2nd option (Right / Top-Right / Red / False)',
+    ];
+  }
+  if (safeOptionCount === 4) {
+    return [
+      '0 = 1st option (Top-Left / Red / Triangle / Option A)',
+      '1 = 2nd option (Top-Right / Blue / Diamond / Option B)',
+      '2 = 3rd option (Bottom-Left / Yellow / Circle / Option C)',
+      '3 = 4th option (Bottom-Right / Green / Square / Option D)',
+    ];
+  }
+  const lines: string[] = [];
+  for (let idx = 0; idx < safeOptionCount; idx += 1) {
+    const letter = String.fromCharCode(65 + idx);
+    lines.push(
+      `${idx} = ${formatOrdinal(idx + 1)} option in reading order (Option ${letter})`
+    );
+  }
+  return lines;
 }
 
 async function compressCaptureToWebp(
@@ -148,7 +190,7 @@ async function queryGeminiTabVision(
 
   const json = await response.json();
   const rawText = extractGeminiInteractionText(json);
-  if (rawText.trim().toUpperCase().includes('NONE')) {
+  if (rawText.trim().toUpperCase() === 'NONE') {
     return { indices: [], hostOnlyBlank: true };
   }
 
@@ -160,11 +202,77 @@ async function queryGeminiTabVision(
   return { indices };
 }
 
+async function queryGeminiTabVisionFillBlank(
+  systemInstruction: string,
+  visionPrompt: string,
+  base64: string,
+  mimeType: 'image/webp' | 'image/jpeg',
+  expectedLength: number | undefined,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<{ fillText: string; hostOnlyBlank?: boolean }> {
+  const response = await fetch(API_ENDPOINTS.GEMINI_INTERACTIONS, {
+    method: 'POST',
+    signal,
+    headers: {
+      'x-goog-api-key': apiKey,
+      'Content-Type': 'application/json',
+      'Api-Revision': GEMINI_API_REVISION,
+    },
+    body: JSON.stringify({
+      model: MODELS.GEMINI_PRIMARY,
+      store: false,
+      system_instruction: systemInstruction,
+      input: [
+        { type: 'text', text: visionPrompt },
+        {
+          type: 'image',
+          data: base64,
+          mime_type: mimeType,
+        },
+      ],
+      generation_config: {
+        thinking_level: 'low',
+        seed: 0,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const errBody = (await response.json()) as {
+        error?: { message?: string };
+      };
+      detail = errBody.error?.message ? `: ${errBody.error.message}` : '';
+    } catch {
+      void 0;
+    }
+    const errMsg = `Gemini Vision HTTP ${response.status}${detail}`;
+    recordProviderAuthFailure('gemini', apiKey, response.status, errMsg);
+    throw new Error(errMsg);
+  }
+
+  const json = await response.json();
+  const rawText = extractGeminiInteractionText(json);
+  if (rawText.trim().toUpperCase() === 'NONE') {
+    return { fillText: '', hostOnlyBlank: true };
+  }
+
+  const answer = parseFillBlankAnswer(rawText, expectedLength);
+  if (!answer) {
+    throw new Error('Gemini Vision returned empty fill-blank answer.');
+  }
+
+  return { fillText: answer };
+}
+
 export async function resolveViaVisionCapture(
   windowId: number | undefined,
   optionCount: number,
   multiSelect: boolean,
-  settings: EngineSettings
+  settings: EngineSettings,
+  context?: VisionSolveContext
 ): Promise<VisionResolutionResult> {
   const hasGemini = settings.geminiApiKey.length > 0;
   const hasGroq = settings.groqApiKey.length > 0;
@@ -204,35 +312,6 @@ export async function resolveViaVisionCapture(
     });
 
     const compressed = await compressCaptureToWebp(rawCaptureUrl);
-    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 4));
-    const systemInstruction = buildQuizSystemInstruction(
-      multiSelect,
-      safeOptionCount,
-      settings.pinnedContext
-    );
-
-    const mappingLines =
-      safeOptionCount === 2
-        ? [
-            '0 = Left / Top-Left (Blue / Diamond / True)',
-            '1 = Right / Top-Right (Red / Triangle / False)',
-          ]
-        : [
-            '0 = Top-Left (Red / Triangle)',
-            '1 = Top-Right (Blue / Diamond)',
-            '2 = Bottom-Left (Yellow / Circle)',
-            '3 = Bottom-Right (Green / Square)',
-          ];
-
-    const visionPrompt = [
-      'Inspect this Kahoot quiz screen.',
-      'Kahoot answer button index mapping:',
-      ...mappingLines,
-      'If no question text or visual puzzle is visible anywhere in the image (only blank colored shapes), output NONE.',
-      multiSelect
-        ? 'Return ONLY the comma-separated zero-based indices of all correct choices.'
-        : `Return ONLY the single zero-based integer index (0 to ${safeOptionCount - 1}) of the correct choice.`,
-    ].join('\n');
 
     const geminiMuted = hasGemini
       ? isProviderKeyMuted('gemini', settings.geminiApiKey)
@@ -246,6 +325,110 @@ export async function resolveViaVisionCapture(
 
     const runGemini = hasGemini && (!anyUnmuted || !geminiMuted);
     const runGroq = hasGroq && (!anyUnmuted || !groqMuted);
+
+    if (context?.questionKind === 'fill_blank') {
+      const systemInstruction = buildFillBlankSystemInstruction(
+        context.blankLengthHint,
+        settings.pinnedContext
+      );
+      const promptLines = [
+        'Inspect this quiz screen (including any formula, diagram, or image) and determine the exact Fill-in-the-Blank answer.',
+      ];
+      if (context.contextQuestionText && context.contextQuestionText.trim().length > 0) {
+        promptLines.push(`Extracted question text: ${context.contextQuestionText.trim()}`);
+      }
+      promptLines.push(
+        'If no quiz question or visual problem is visible anywhere in the image, output NONE.',
+        'Output ONLY the exact missing word, number, or short phrase with zero explanation.'
+      );
+      const fillVisionPrompt = promptLines.join('\n');
+
+      const fillTasks: Array<
+        Promise<{ fillText: string; hostOnlyBlank?: boolean }>
+      > = [];
+
+      if (runGemini) {
+        fillTasks.push(
+          queryGeminiTabVisionFillBlank(
+            systemInstruction,
+            fillVisionPrompt,
+            compressed.base64,
+            compressed.mimeType,
+            context.blankLengthHint,
+            settings.geminiApiKey,
+            geminiAbort.signal
+          )
+        );
+      }
+
+      if (runGroq) {
+        fillTasks.push(
+          runGroqVisionFillBlankWithFallback(
+            systemInstruction,
+            fillVisionPrompt,
+            compressed.base64,
+            compressed.mimeType,
+            context.blankLengthHint,
+            settings.groqApiKey,
+            groqAbort.signal
+          )
+        );
+      }
+
+      try {
+        const winner = await Promise.any(fillTasks);
+        return {
+          indices: [],
+          fillText: winner.fillText,
+          latencyMs: Math.round(performance.now() - startedAt),
+          hostOnlyBlank: winner.hostOnlyBlank,
+        };
+      } catch (err) {
+        if (err instanceof AggregateError && err.errors.length > 0) {
+          const msg = err.errors
+            .map((item) => (item instanceof Error ? item.message : String(item)))
+            .join('; ');
+          throw new Error(msg);
+        }
+        throw err instanceof Error ? err : new Error('Vision fill-blank failed');
+      }
+    }
+
+    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 8));
+    const systemInstruction = buildQuizSystemInstruction(
+      multiSelect,
+      safeOptionCount,
+      settings.pinnedContext
+    );
+
+    const mappingLines = buildVisionOptionMappingLines(safeOptionCount);
+    const promptLines: string[] = [
+      'Inspect this quiz screen (Kahoot or Wayground/Quizizz), including any embedded diagram, chart, or mathematical formula.',
+      'Answer option zero-based index mapping:',
+      ...mappingLines,
+    ];
+
+    if (context?.contextQuestionText && context.contextQuestionText.trim().length > 0) {
+      promptLines.push(`Question stem text: ${context.contextQuestionText.trim()}`);
+    }
+    if (
+      context?.contextOptions &&
+      context.contextOptions.some((opt) => opt.trim().length > 0)
+    ) {
+      const formattedOpts = context.contextOptions
+        .map((opt, idx) => `[${idx}] ${opt}`)
+        .join('\n');
+      promptLines.push(`DOM Option Texts:\n${formattedOpts}`);
+    }
+
+    promptLines.push(
+      'If no question text or visual puzzle is visible anywhere in the image (only blank colored shapes with no question), output NONE.',
+      multiSelect
+        ? 'Return ONLY the comma-separated zero-based indices of all correct choices.'
+        : `Return ONLY the single zero-based integer index (0 to ${safeOptionCount - 1}) of the correct choice.`
+    );
+
+    const visionPrompt = promptLines.join('\n');
 
     const tasks: Array<Promise<{ indices: number[]; hostOnlyBlank?: boolean }>> =
       [];

@@ -22,6 +22,7 @@ export const DEFAULT_SETTINGS: EngineSettings = {
   geminiApiKey: '',
   openRouterApiKey: '',
   consensusMode: 'consensus_vote',
+  antiFocusLoss: true,
   pinnedContext: '',
   triggerMode: 'instant_auto_click',
   targetScore: 860,
@@ -60,6 +61,27 @@ export const SELECTORS = {
     '[data-functional-selector="question-countdown"], [data-functional-selector*="countdown"], [data-functional-selector*="timer"]',
   POST_SUBMIT_INDICATORS:
     '[data-functional-selector="next-button"], [data-functional-selector*="question-result"], [data-functional-selector*="answer-result"], [data-functional-selector*="correct-answer"]',
+} as const;
+
+export const WAYGROUND_SELECTORS = {
+  QUESTION_TITLE:
+    '[data-testid="question-container-text"], [data-cy="question-container-text"], [data-highlight-block="stem"], .question-text-color, #questionText, .question-container .resizeable-text',
+  QUESTION_MEDIA_IMG:
+    '[data-testid="question-container"] img, [data-cy="question-container"] img, .question-media img, .question-image img, [data-testid*="question-image"] img, img[data-testid*="question"]',
+  INDEXED_OPTION: (index: number) =>
+    `[data-testid="option-trigger-${index}"], [data-testid="option-${index}"], [data-cy="option-${index}"]`,
+  ALL_OPTION_CANDIDATES:
+    '[data-testid^="option-trigger-"], [data-testid^="option-"]:not([data-testid*="container"]):not([data-testid*="options"]):not([data-testid*="text"]):not([data-testid*="label"]), [data-cy^="option-"]:not([data-cy*="container"]):not([data-cy*="options"]), .options-grid .option, .options-container .option, button.option, [role="option"]',
+  SUBMIT_BUTTON:
+    '[data-testid="msq-submit-button"], [data-testid="typed-submit-button"], [data-testid="save-button"], [data-testid*="submit-btn"], [data-testid*="submit-button"], [data-cy*="submit"], button.submit-button',
+  BLANK_INPUTS:
+    'input.typed-option-input, input.box-input, input[data-cy^="box"], [data-testid*="fib-input"], [data-testid*="blank-input"], [data-testid*="typed-input"] input, .typed-answer-wrapper input, .fib-container input',
+  QUESTION_COUNTER:
+    '[data-testid="question-index"], [data-cy="current-question-number"], .current-question-number, [data-testid*="question-counter"]',
+  QUESTION_TIMER:
+    '[data-testid*="timer"], [data-cy*="timer"], .timer-text',
+  POST_SUBMIT_INDICATORS:
+    '[data-testid*="result"], [data-cy*="feedback"], .answer-feedback',
 } as const;
 
 export const API_ENDPOINTS = {

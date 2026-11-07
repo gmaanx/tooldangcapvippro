@@ -7,7 +7,12 @@ import {
   STORAGE_KEYS,
   WARMUP_COOLDOWN_MS,
 } from '../shared/constants';
-import { computeFnv1aHash, parseAnswerIndices } from '../shared/normalize';
+import {
+  computeFnv1aHash,
+  normalizeQuestionText,
+  parseAnswerIndices,
+  parseFillBlankAnswer,
+} from '../shared/normalize';
 import { updateTelemetry } from '../shared/storage';
 import type {
   AiProviderId,
@@ -18,6 +23,7 @@ import type {
 
 export interface RaceResult {
   indices: number[];
+  fillText?: string;
   tier: Extract<
     ResolutionTier,
     | 'tier3_consensus'
@@ -1345,11 +1351,687 @@ export async function raceCustomPromptInference(
   }
 }
 
+export function buildFillBlankSystemInstruction(
+  blankLengthHint: number | undefined,
+  pinnedContext: string
+): string {
+  const lengthRule =
+    typeof blankLengthHint === 'number' && blankLengthHint > 0
+      ? ` CRITICAL: The input box has exactly ${blankLengthHint} character slots, so your answer MUST be ${blankLengthHint} characters (excluding spaces if needed to fit ${blankLengthHint}).`
+      : '';
+  const baseDirective = `You are an expert deterministic quiz solver for Fill-in-the-Blank and Short-Answer questions. Output ONLY the exact missing word, number, symbol, or concise phrase that answers the question.${lengthRule} Output zero explanation, zero surrounding quotes, zero markdown, and zero trailing period.`;
+
+  const trimmedContext = pinnedContext.trim();
+  if (!trimmedContext) {
+    return baseDirective;
+  }
+  return `${baseDirective}\n\nReference Context (ground your answer in these notes first):\n${trimmedContext}`;
+}
+
+async function runGroqFillBlankWithFallback(
+  systemInstruction: string,
+  userPrompt: string,
+  expectedLength: number | undefined,
+  apiKey: string,
+  signal: AbortSignal,
+  preferredModel?: string,
+  initialExclusions: Iterable<string> = []
+): Promise<string> {
+  const excluded = new Set<string>(initialExclusions);
+  let lastError = 'Groq fill-blank inference failed';
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const modelId = await selectGroqTextModel(
+      apiKey,
+      excluded,
+      attempt > 0,
+      attempt === 0 ? preferredModel : undefined
+    );
+    const maxTokens = isReasoningModel(modelId) ? 280 : 40;
+
+    const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
+      method: 'POST',
+      signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0,
+        max_tokens: maxTokens,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const errBody = (await response.json()) as OpenAiChatResponse;
+        detail = errBody.error?.message ? `: ${errBody.error.message}` : '';
+      } catch {
+        void 0;
+      }
+      lastError = `Groq HTTP ${response.status}${detail}`;
+      if (response.status === 401 || response.status === 403) {
+        recordProviderAuthFailure('groq', apiKey, response.status, lastError);
+        throw new Error(lastError);
+      }
+      if (
+        response.status === 404 ||
+        response.status === 400 ||
+        response.status === 429
+      ) {
+        excluded.add(modelId);
+        continue;
+      }
+      throw new Error(lastError);
+    }
+
+    const json = (await response.json()) as OpenAiChatResponse;
+    const content = extractOpenAiMessageText(json.choices?.[0]?.message?.content);
+    const answer = parseFillBlankAnswer(content, expectedLength);
+    if (answer.length > 0) {
+      if (!preferredModel) {
+        void recordVerifiedGroqModel(apiKey, 'text', modelId);
+      }
+      return answer;
+    }
+    excluded.add(modelId);
+    lastError = `Groq (${modelId}) returned empty fill-blank answer`;
+  }
+
+  throw new Error(lastError);
+}
+
+async function runOpenRouterFillBlankWithFallback(
+  systemInstruction: string,
+  userPrompt: string,
+  expectedLength: number | undefined,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<string> {
+  const keyHash = computeFnv1aHash(apiKey);
+  const candidates: string[] = [];
+  if (verifiedOpenRouterModel && verifiedOpenRouterModel.keyHash === keyHash) {
+    candidates.push(verifiedOpenRouterModel.modelId);
+  }
+  for (const model of MODELS.OPENROUTER_TEXT_CANDIDATES) {
+    if (!candidates.includes(model)) {
+      candidates.push(model);
+    }
+  }
+  if (!candidates.includes('openrouter/auto')) {
+    candidates.push('openrouter/auto');
+  }
+
+  let lastError = 'OpenRouter fill-blank inference failed';
+
+  for (let attempt = 0; attempt < Math.min(3, candidates.length); attempt += 1) {
+    const modelId = candidates[attempt];
+    const maxTokens =
+      isReasoningModel(modelId) || modelId === 'openrouter/auto' ? 280 : 48;
+
+    const response = await fetch(API_ENDPOINTS.OPENROUTER_CHAT_COMPLETIONS, {
+      method: 'POST',
+      signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://wayground.com',
+        'X-Title': 'KahootHybridEngine',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0,
+        max_tokens: maxTokens,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const errBody = (await response.json()) as OpenAiChatResponse;
+        const msg = errBody.error?.message ?? errBody.message;
+        detail = msg ? `: ${msg}` : '';
+      } catch {
+        void 0;
+      }
+      lastError = `OpenRouter HTTP ${response.status}${detail}`;
+      if (response.status === 401 || response.status === 403) {
+        recordProviderAuthFailure(
+          'openrouter',
+          apiKey,
+          response.status,
+          lastError
+        );
+        throw new Error(lastError);
+      }
+      if (
+        response.status === 404 ||
+        response.status === 400 ||
+        response.status === 402 ||
+        response.status === 429 ||
+        response.status === 503
+      ) {
+        continue;
+      }
+      throw new Error(lastError);
+    }
+
+    const json = (await response.json()) as OpenAiChatResponse;
+    const content = extractOpenAiMessageText(json.choices?.[0]?.message?.content);
+    const answer = parseFillBlankAnswer(content, expectedLength);
+    if (answer.length > 0) {
+      verifiedOpenRouterModel = { keyHash, modelId };
+      return answer;
+    }
+    lastError = `OpenRouter (${modelId}) returned empty fill-blank answer`;
+  }
+
+  throw new Error(lastError);
+}
+
+async function runGeminiFillBlankCompletion(
+  systemInstruction: string,
+  userPrompt: string,
+  expectedLength: number | undefined,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<string> {
+  const response = await fetch(API_ENDPOINTS.GEMINI_INTERACTIONS, {
+    method: 'POST',
+    signal,
+    headers: {
+      'x-goog-api-key': apiKey,
+      'Content-Type': 'application/json',
+      'Api-Revision': GEMINI_API_REVISION,
+    },
+    body: JSON.stringify({
+      model: MODELS.GEMINI_PRIMARY,
+      store: false,
+      system_instruction: systemInstruction,
+      input: userPrompt,
+      generation_config: {
+        thinking_level: 'low',
+        seed: 0,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const errBody = (await response.json()) as {
+        error?: { message?: string };
+      };
+      detail = errBody.error?.message ? `: ${errBody.error.message}` : '';
+    } catch {
+      void 0;
+    }
+    const errMsg = `Gemini HTTP ${response.status}${detail}`;
+    recordProviderAuthFailure('gemini', apiKey, response.status, errMsg);
+    throw new Error(errMsg);
+  }
+
+  const json = (await response.json()) as GeminiInteractionResponse;
+  const rawText = extractGeminiInteractionText(json);
+  const answer = parseFillBlankAnswer(rawText, expectedLength);
+  if (!answer) {
+    throw new Error('Gemini returned empty fill-blank answer');
+  }
+  return answer;
+}
+
+export async function runGroqVisionFillBlankWithFallback(
+  systemInstruction: string,
+  visionPrompt: string,
+  base64: string,
+  mimeType: string,
+  expectedLength: number | undefined,
+  apiKey: string,
+  signal: AbortSignal
+): Promise<{ fillText: string; hostOnlyBlank?: boolean }> {
+  const excluded = new Set<string>();
+  let lastError = 'No Groq Vision model available on this API key.';
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const modelId = await selectGroqVisionModel(apiKey, excluded, attempt > 0);
+    if (!modelId) {
+      break;
+    }
+    const maxTokens = isReasoningModel(modelId) ? 280 : 48;
+    const dataImageUri = 'data:' + mimeType + ';base64,' + base64;
+
+    const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
+      method: 'POST',
+      signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: systemInstruction },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: visionPrompt },
+              {
+                type: 'image_url',
+                image_url: { url: dataImageUri },
+              },
+            ],
+          },
+        ],
+        temperature: 0,
+        max_tokens: maxTokens,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const errBody = (await response.json()) as OpenAiChatResponse;
+        detail = errBody.error?.message ? `: ${errBody.error.message}` : '';
+      } catch {
+        void 0;
+      }
+      lastError = `Groq Vision HTTP ${response.status}${detail}`;
+      if (response.status === 401 || response.status === 403) {
+        recordProviderAuthFailure('groq', apiKey, response.status, lastError);
+        throw new Error(lastError);
+      }
+      if (
+        response.status === 404 ||
+        response.status === 400 ||
+        response.status === 429
+      ) {
+        excluded.add(modelId);
+        continue;
+      }
+      throw new Error(lastError);
+    }
+
+    const json = (await response.json()) as OpenAiChatResponse;
+    const rawContent = extractOpenAiMessageText(
+      json.choices?.[0]?.message?.content
+    );
+    const cleanedUpper = rawContent
+      .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
+      .trim()
+      .toUpperCase();
+
+    if (cleanedUpper === 'NONE') {
+      void recordVerifiedGroqModel(apiKey, 'vision', modelId);
+      return { fillText: '', hostOnlyBlank: true };
+    }
+
+    const answer = parseFillBlankAnswer(rawContent, expectedLength);
+    if (answer.length > 0) {
+      void recordVerifiedGroqModel(apiKey, 'vision', modelId);
+      return { fillText: answer };
+    }
+    excluded.add(modelId);
+    lastError = `Groq Vision (${modelId}) returned empty fill-blank answer`;
+  }
+
+  throw new Error(lastError);
+}
+
+export async function raceCustomFillBlankInference(
+  systemInstruction: string,
+  userPrompt: string,
+  expectedLength: number | undefined,
+  settings: EngineSettings,
+  startedAt = performance.now()
+): Promise<RaceResult> {
+  const configuredProviders: Array<{
+    provider: AiProviderId;
+    apiKey: string;
+    mutedMsg: string | null;
+  }> = [];
+
+  if (settings.groqApiKey.length > 0) {
+    configuredProviders.push({
+      provider: 'groq',
+      apiKey: settings.groqApiKey,
+      mutedMsg: isProviderKeyMuted('groq', settings.groqApiKey),
+    });
+  }
+  if (settings.geminiApiKey.length > 0) {
+    configuredProviders.push({
+      provider: 'gemini',
+      apiKey: settings.geminiApiKey,
+      mutedMsg: isProviderKeyMuted('gemini', settings.geminiApiKey),
+    });
+  }
+  if (settings.openRouterApiKey.length > 0) {
+    configuredProviders.push({
+      provider: 'openrouter',
+      apiKey: settings.openRouterApiKey,
+      mutedMsg: isProviderKeyMuted('openrouter', settings.openRouterApiKey),
+    });
+  }
+
+  const tryLocalFill = async (): Promise<RaceResult | null> => {
+    try {
+      const lm = globalThis.LanguageModel;
+      if (!lm || typeof lm.availability !== 'function') {
+        return null;
+      }
+      if ((await lm.availability()) !== 'available') {
+        return null;
+      }
+      const session = await lm.create({
+        temperature: 0,
+        topK: 1,
+        initialPrompts: [{ role: 'system', content: systemInstruction }],
+      });
+      try {
+        const rawOut = await session.prompt(userPrompt);
+        const parsed = parseFillBlankAnswer(rawOut, expectedLength);
+        if (parsed) {
+          return {
+            indices: [],
+            fillText: parsed,
+            tier: 'tier3_local_ai',
+            latencyMs: Math.round(performance.now() - startedAt),
+          };
+        }
+        return null;
+      } finally {
+        session.destroy();
+      }
+    } catch {
+      return null;
+    }
+  };
+
+  if (configuredProviders.length === 0) {
+    const localRes = await tryLocalFill();
+    if (localRes) {
+      return localRes;
+    }
+    throw new Error(
+      'Configure at least one API key (Groq, Gemini, or OpenRouter) in Popup.'
+    );
+  }
+
+  const anyUnmuted = configuredProviders.some((entry) => !entry.mutedMsg);
+  const runnableProviders = anyUnmuted
+    ? configuredProviders.filter((entry) => !entry.mutedMsg)
+    : configuredProviders;
+  const useConsensus = settings.consensusMode !== 'fastest_first';
+  const nonGroqCount = runnableProviders.filter(
+    (entry) => entry.provider !== 'groq'
+  ).length;
+
+  interface TextVoterSpec {
+    tier: RaceResult['tier'];
+    weight: number;
+    run: (signal: AbortSignal) => Promise<string>;
+  }
+
+  const textVoters: TextVoterSpec[] = [];
+
+  for (const entry of runnableProviders) {
+    if (entry.provider === 'gemini') {
+      textVoters.push({
+        tier: 'tier3_gemini',
+        weight: 1.42,
+        run: (signal) =>
+          runGeminiFillBlankCompletion(
+            systemInstruction,
+            userPrompt,
+            expectedLength,
+            entry.apiKey,
+            signal
+          ),
+      });
+    } else if (entry.provider === 'openrouter') {
+      textVoters.push({
+        tier: 'tier3_openrouter',
+        weight: 1.28,
+        run: (signal) =>
+          runOpenRouterFillBlankWithFallback(
+            systemInstruction,
+            userPrompt,
+            expectedLength,
+            entry.apiKey,
+            signal
+          ),
+      });
+    } else if (entry.provider === 'groq') {
+      if (!useConsensus) {
+        textVoters.push({
+          tier: 'tier3_groq',
+          weight: 1.15,
+          run: (signal) =>
+            runGroqFillBlankWithFallback(
+              systemInstruction,
+              userPrompt,
+              expectedLength,
+              entry.apiKey,
+              signal
+            ),
+        });
+      } else {
+        const desiredGroq = nonGroqCount >= 2 ? 1 : 2;
+        const groqModels = await pickDistinctGroqConsensusModels(
+          entry.apiKey,
+          desiredGroq
+        );
+        groqModels.forEach((assignedModel, idx) => {
+          const siblings = groqModels.filter((_, j) => j !== idx);
+          textVoters.push({
+            tier: 'tier3_groq',
+            weight: computeGroqModelWeight(assignedModel),
+            run: (signal) =>
+              runGroqFillBlankWithFallback(
+                systemInstruction,
+                userPrompt,
+                expectedLength,
+                entry.apiKey,
+                signal,
+                assignedModel,
+                siblings
+              ),
+          });
+        });
+      }
+    }
+  }
+
+  const controllers = textVoters.map(() => new AbortController());
+  const hardTimeoutHandle = setTimeout(() => {
+    for (const ctrl of controllers) {
+      ctrl.abort();
+    }
+  }, INFERENCE_TIMEOUT_MS);
+
+  try {
+    if (!useConsensus || textVoters.length === 1) {
+      const winner = await Promise.any(
+        textVoters.map(async (voter, idx): Promise<RaceResult> => {
+          const fillText = await voter.run(controllers[idx].signal);
+          return {
+            indices: [],
+            fillText,
+            tier: voter.tier,
+            latencyMs: Math.round(performance.now() - startedAt),
+          };
+        })
+      );
+      return winner;
+    }
+
+    return await new Promise<RaceResult>((resolve, reject) => {
+      let finished = false;
+      let settledCount = 0;
+      let validVotes = 0;
+      let windowTimer: ReturnType<typeof setTimeout> | null = null;
+      const errors: Error[] = [];
+      const buckets = new Map<
+        string,
+        {
+          fillText: string;
+          count: number;
+          totalWeight: number;
+          firstLatencyMs: number;
+          tier: RaceResult['tier'];
+        }
+      >();
+
+      const rank = () =>
+        Array.from(buckets.values()).sort((a, b) => {
+          if (b.count !== a.count) {
+            return b.count - a.count;
+          }
+          if (Math.abs(b.totalWeight - a.totalWeight) > 0.001) {
+            return b.totalWeight - a.totalWeight;
+          }
+          return a.firstLatencyMs - b.firstLatencyMs;
+        });
+
+      const finalize = () => {
+        if (finished) {
+          return;
+        }
+        const ranked = rank();
+        if (ranked.length === 0) {
+          return;
+        }
+        finished = true;
+        if (windowTimer !== null) {
+          clearTimeout(windowTimer);
+          windowTimer = null;
+        }
+        const best = ranked[0];
+        const isConsensus = best.count >= 2;
+        resolve({
+          indices: [],
+          fillText: best.fillText,
+          tier: isConsensus ? 'tier3_consensus' : best.tier,
+          latencyMs: Math.round(performance.now() - startedAt),
+          voteSummary: isConsensus
+            ? `${best.count}/${Math.max(best.count, validVotes)}`
+            : undefined,
+        });
+      };
+
+      textVoters.forEach((voter, idx) => {
+        void (async () => {
+          try {
+            const ans = await voter.run(controllers[idx].signal);
+            if (finished) {
+              return;
+            }
+            settledCount += 1;
+            validVotes += 1;
+            const normKey = normalizeQuestionText(ans) || ans.toLowerCase();
+            const existing = buckets.get(normKey);
+            if (existing) {
+              existing.count += 1;
+              existing.totalWeight += voter.weight;
+            } else {
+              buckets.set(normKey, {
+                fillText: ans,
+                count: 1,
+                totalWeight: voter.weight,
+                firstLatencyMs: Math.round(performance.now() - startedAt),
+                tier: voter.tier,
+              });
+            }
+            const ranked = rank();
+            const top = ranked[0];
+            const runnerUp = ranked[1]?.count ?? 0;
+            if (top && top.count >= 2 && top.count > runnerUp) {
+              finalize();
+              return;
+            }
+            if (settledCount >= textVoters.length) {
+              finalize();
+              return;
+            }
+            if (windowTimer === null) {
+              windowTimer = setTimeout(() => {
+                windowTimer = null;
+                finalize();
+              }, CONSENSUS_DECISION_WINDOW_MS);
+            }
+          } catch (err) {
+            if (finished) {
+              return;
+            }
+            settledCount += 1;
+            errors.push(err instanceof Error ? err : new Error(String(err)));
+            if (settledCount >= textVoters.length) {
+              if (buckets.size > 0) {
+                finalize();
+              } else {
+                finished = true;
+                if (windowTimer !== null) {
+                  clearTimeout(windowTimer);
+                }
+                reject(new AggregateError(errors, 'All fill-blank voters failed'));
+              }
+            }
+          }
+        })();
+      });
+    });
+  } catch (err) {
+    const localRes = await tryLocalFill();
+    if (localRes) {
+      return localRes;
+    }
+    if (err instanceof AggregateError && err.errors.length > 0) {
+      const details = err.errors
+        .map((item) => (item instanceof Error ? item.message : String(item)))
+        .join('; ');
+      throw new Error(`AI Fill-Blank failed: ${details}`);
+    }
+    throw err instanceof Error ? err : new Error('AI Fill-Blank failed');
+  } finally {
+    clearTimeout(hardTimeoutHandle);
+    for (const ctrl of controllers) {
+      ctrl.abort();
+    }
+  }
+}
+
 export async function raceParallelInference(
   payload: QuestionPayload,
   settings: EngineSettings
 ): Promise<RaceResult> {
   const startedAt = performance.now();
+  if (payload.questionKind === 'fill_blank') {
+    const systemInstruction = buildFillBlankSystemInstruction(
+      payload.blankLengthHint,
+      settings.pinnedContext
+    );
+    const userPrompt = `Question: ${payload.questionText}`;
+    return raceCustomFillBlankInference(
+      systemInstruction,
+      userPrompt,
+      payload.blankLengthHint,
+      settings,
+      startedAt
+    );
+  }
+
   const optionCount = Math.max(
     2,
     payload.optionCount || payload.options.length || 4

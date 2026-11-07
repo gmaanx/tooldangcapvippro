@@ -3,7 +3,12 @@ import {
   DEFAULT_TELEMETRY,
   STORAGE_KEYS,
 } from '../shared/constants';
-import { buildQuestionStateHash, extractUuid } from '../shared/normalize';
+import {
+  buildQuestionStateHash,
+  extractUuid,
+  isKahootHostname,
+  isWaygroundHostname,
+} from '../shared/normalize';
 import {
   loadSettings,
   loadTelemetry,
@@ -14,6 +19,7 @@ import type {
   ClipboardExtractedPayload,
   ContentPushMessage,
   EngineSettings,
+  QuestionKind,
   QuestionPayload,
   RuntimeCacheResponse,
   RuntimeClickResponse,
@@ -32,15 +38,18 @@ import {
   ingestKahootRestPayload,
   isQuizUuidAlreadyCached,
   lookupLearnedCache,
+  lookupLearnedFillBlank,
   lookupTier1Cache,
   prefetchAndCacheQuiz,
   recordLearnedAnswer,
 } from './quiz-cache';
 import {
+  SUPPORTED_TAB_URL_PATTERNS,
   clearUserCanceledCooldown,
   detachAllDebuggerTabs,
   detachDebuggerFromTab,
   executeTrustedClickInTab,
+  executeTrustedTextFillInTab,
   isKahootActiveGameplayUrl,
   isKahootLobbyOrEndUrl,
   preattachDebuggerToKahootPlayerTabs,
@@ -163,10 +172,16 @@ function isKahootPlayableUrl(url: string | undefined): boolean {
   if (!url) {
     return false;
   }
-  return (
-    url.startsWith('https://kahoot.it/') ||
-    url.startsWith('https://play.kahoot.it/')
-  );
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === 'kahoot.it' ||
+      host === 'play.kahoot.it' ||
+      isWaygroundHostname(host)
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function findTargetKahootTab(
@@ -192,28 +207,24 @@ async function findTargetKahootTab(
     return focusedTab;
   }
 
-  const kahootTabs = await chrome.tabs.query({
-    url: ['https://kahoot.it/*', 'https://play.kahoot.it/*'],
+  const quizTabs = await chrome.tabs.query({
+    url: SUPPORTED_TAB_URL_PATTERNS,
   });
-  const activeKahootTab = kahootTabs.find(
+  const activeQuizTab = quizTabs.find(
     (item) => item.active && typeof item.id === 'number'
   );
-  if (activeKahootTab) {
-    return activeKahootTab;
+  if (activeQuizTab) {
+    return activeQuizTab;
   }
 
-  return kahootTabs.find((item) => typeof item.id === 'number') ?? focusedTab;
+  return quizTabs.find((item) => typeof item.id === 'number') ?? focusedTab;
 }
 
 async function ensureContentScriptsOnOpenKahootTabs(): Promise<void> {
   try {
     const settings = await getFastSettings();
     const openTabs = await chrome.tabs.query({
-      url: [
-        'https://kahoot.it/*',
-        'https://play.kahoot.it/*',
-        'https://create.kahoot.it/*',
-      ],
+      url: SUPPORTED_TAB_URL_PATTERNS,
     });
 
     for (const tab of openTabs) {
@@ -284,6 +295,7 @@ async function broadcastResolutionToPlayerTabs(
         settings.enabled &&
         settings.triggerMode === 'instant_auto_click' &&
         !enriched.multiSelect &&
+        enriched.questionKind !== 'fill_blank' &&
         tab.url?.startsWith('https://kahoot.it/')
       ) {
         void executeTrustedClickInTab(tab.id, enriched.indices, false, false);
@@ -315,20 +327,200 @@ async function handleQuestionResolution(
     const enriched = attachTriggerSettings(base, settings, payload.multiSelect);
     if (
       settings.triggerMode === 'instant_auto_click' &&
-      !payload.multiSelect &&
       typeof senderTabId === 'number'
     ) {
-      void executeTrustedClickInTab(
-        senderTabId,
-        enriched.indices,
-        false,
-        false
-      );
+      if (enriched.questionKind === 'fill_blank' && enriched.fillText) {
+        void executeTrustedTextFillInTab(senderTabId, enriched.fillText, true);
+      } else if (!payload.multiSelect && enriched.indices.length > 0) {
+        void executeTrustedClickInTab(
+          senderTabId,
+          enriched.indices,
+          false,
+          false
+        );
+      }
     }
     return { ok: true, resolution: enriched };
   };
 
   const startedAt = performance.now();
+
+  if (payload.questionKind === 'fill_blank') {
+    const learnedFill = await lookupLearnedFillBlank(payload.questionText);
+    if (learnedFill) {
+      const latencyMs = Math.max(0, Math.round(performance.now() - startedAt));
+      const resolution: AnswerResolution = {
+        stateHash: payload.stateHash,
+        questionIndex: payload.questionIndex,
+        indices: [],
+        fillText: learnedFill,
+        questionKind: 'fill_blank',
+        tier: 'tier1_learned',
+        latencyMs,
+        timestamp: Date.now(),
+      };
+
+      void Promise.all([
+        updateTelemetry({
+          lastTier: 'tier1_learned',
+          lastLatencyMs: latencyMs,
+          lastIndices: [],
+          lastQuestionHash: payload.stateHash,
+          lastError: null,
+        }),
+        setBadgeFeedback('TXT', '#059669'),
+      ]);
+
+      return finalizeResolution(resolution);
+    }
+
+    const canRunVision =
+      settings.groqApiKey.length > 0 || settings.geminiApiKey.length > 0;
+
+    if (payload.hasQuestionImage && canRunVision) {
+      try {
+        const visionFill = await resolveViaVisionCapture(
+          senderWindowId,
+          4,
+          false,
+          settings,
+          {
+            questionKind: 'fill_blank',
+            blankLengthHint: payload.blankLengthHint,
+            contextQuestionText: payload.questionText,
+          }
+        );
+        if (!visionFill.hostOnlyBlank && visionFill.fillText) {
+          void recordLearnedAnswer(
+            payload.questionText,
+            [],
+            [],
+            false,
+            visionFill.fillText
+          );
+          const resolution: AnswerResolution = {
+            stateHash: payload.stateHash,
+            questionIndex: payload.questionIndex,
+            indices: [],
+            fillText: visionFill.fillText,
+            questionKind: 'fill_blank',
+            tier: 'tier4_vision',
+            latencyMs: visionFill.latencyMs,
+            timestamp: Date.now(),
+          };
+          void Promise.all([
+            updateTelemetry({
+              lastTier: 'tier4_vision',
+              lastLatencyMs: visionFill.latencyMs,
+              lastIndices: [],
+              lastQuestionHash: payload.stateHash,
+              lastError: null,
+            }),
+            setBadgeFeedback('TXT', '#9333EA'),
+          ]);
+          return finalizeResolution(resolution);
+        }
+      } catch {
+        void 0;
+      }
+    }
+
+    if (payload.questionText.trim().length > 0) {
+      try {
+        const raceWinner = await raceParallelInference(payload, settings);
+        const answerText = raceWinner.fillText ?? '';
+        if (!answerText) {
+          return { ok: false, error: 'AI returned an empty fill-blank answer.' };
+        }
+
+        void recordLearnedAnswer(
+          payload.questionText,
+          [],
+          [],
+          false,
+          answerText
+        );
+
+        const resolution: AnswerResolution = {
+          stateHash: payload.stateHash,
+          questionIndex: payload.questionIndex,
+          indices: [],
+          fillText: answerText,
+          questionKind: 'fill_blank',
+          tier: raceWinner.tier,
+          latencyMs: raceWinner.latencyMs,
+          timestamp: Date.now(),
+          voteSummary: raceWinner.voteSummary,
+        };
+
+        const badgeColor =
+          raceWinner.tier === 'tier3_consensus' ? '#0284C7' : '#2563EB';
+        void Promise.all([
+          updateTelemetry({
+            lastTier: raceWinner.tier,
+            lastLatencyMs: raceWinner.latencyMs,
+            lastIndices: [],
+            lastQuestionHash: payload.stateHash,
+            lastError: null,
+          }),
+          setBadgeFeedback('TXT', badgeColor),
+        ]);
+
+        return finalizeResolution(resolution);
+      } catch (err) {
+        const errorMsg =
+          err instanceof Error ? err.message : 'Fill-blank inference failed';
+        void updateTelemetry({ lastError: errorMsg });
+        return { ok: false, error: errorMsg };
+      }
+    }
+
+    try {
+      const visionFill = await resolveViaVisionCapture(
+        senderWindowId,
+        4,
+        false,
+        settings,
+        {
+          questionKind: 'fill_blank',
+          blankLengthHint: payload.blankLengthHint,
+        }
+      );
+      if (visionFill.hostOnlyBlank || !visionFill.fillText) {
+        return {
+          ok: false,
+          hostOnlyBlank: Boolean(visionFill.hostOnlyBlank),
+          error: 'Could not detect fill-in-the-blank question on screen.',
+        };
+      }
+      const resolution: AnswerResolution = {
+        stateHash: payload.stateHash,
+        questionIndex: payload.questionIndex,
+        indices: [],
+        fillText: visionFill.fillText,
+        questionKind: 'fill_blank',
+        tier: 'tier4_vision',
+        latencyMs: visionFill.latencyMs,
+        timestamp: Date.now(),
+      };
+      void Promise.all([
+        updateTelemetry({
+          lastTier: 'tier4_vision',
+          lastLatencyMs: visionFill.latencyMs,
+          lastIndices: [],
+          lastQuestionHash: payload.stateHash,
+          lastError: null,
+        }),
+        setBadgeFeedback('TXT', '#9333EA'),
+      ]);
+      return finalizeResolution(resolution);
+    } catch (err) {
+      const errorMsg =
+        err instanceof Error ? err.message : 'Vision fill-blank failed';
+      void updateTelemetry({ lastError: errorMsg });
+      return { ok: false, error: errorMsg };
+    }
+  }
 
   if (
     settings.quizId &&
@@ -349,6 +541,7 @@ async function handleQuestionResolution(
       stateHash: payload.stateHash,
       questionIndex: payload.questionIndex,
       indices: cachedIndices,
+      questionKind: 'choice',
       tier: 'tier1_cache',
       latencyMs,
       timestamp: Date.now(),
@@ -379,6 +572,7 @@ async function handleQuestionResolution(
       stateHash: payload.stateHash,
       questionIndex: payload.questionIndex,
       indices: learnedIndices,
+      questionKind: 'choice',
       tier: 'tier1_learned',
       latencyMs,
       timestamp: Date.now(),
@@ -402,6 +596,60 @@ async function handleQuestionResolution(
   const hasReadableOptions = payload.options.some(
     (opt) => opt.trim().length > 0
   );
+  const canRunVision =
+    settings.groqApiKey.length > 0 || settings.geminiApiKey.length > 0;
+
+  if (
+    payload.platform === 'wayground' &&
+    payload.hasQuestionImage &&
+    canRunVision
+  ) {
+    try {
+      const visionResult = await resolveViaVisionCapture(
+        senderWindowId,
+        payload.optionCount,
+        payload.multiSelect,
+        settings,
+        {
+          questionKind: 'choice',
+          contextQuestionText: payload.questionText,
+          contextOptions: payload.options,
+        }
+      );
+      if (!visionResult.hostOnlyBlank && visionResult.indices.length > 0) {
+        if (hasReadableQuestion && hasReadableOptions) {
+          void recordLearnedAnswer(
+            payload.questionText,
+            payload.options,
+            visionResult.indices,
+            false
+          );
+        }
+        const resolution: AnswerResolution = {
+          stateHash: payload.stateHash,
+          questionIndex: payload.questionIndex,
+          indices: visionResult.indices,
+          questionKind: 'choice',
+          tier: 'tier4_vision',
+          latencyMs: visionResult.latencyMs,
+          timestamp: Date.now(),
+        };
+        void Promise.all([
+          updateTelemetry({
+            lastTier: 'tier4_vision',
+            lastLatencyMs: visionResult.latencyMs,
+            lastIndices: visionResult.indices,
+            lastQuestionHash: payload.stateHash,
+            lastError: null,
+          }),
+          setBadgeFeedback(visionResult.indices.join(','), '#9333EA'),
+        ]);
+        return finalizeResolution(resolution);
+      }
+    } catch {
+      void 0;
+    }
+  }
 
   if (hasReadableQuestion && hasReadableOptions) {
     try {
@@ -410,6 +658,7 @@ async function handleQuestionResolution(
         stateHash: payload.stateHash,
         questionIndex: payload.questionIndex,
         indices: raceWinner.indices,
+        questionKind: 'choice',
         tier: raceWinner.tier,
         latencyMs: raceWinner.latencyMs,
         timestamp: Date.now(),
@@ -451,7 +700,12 @@ async function handleQuestionResolution(
       senderWindowId,
       payload.optionCount,
       payload.multiSelect,
-      settings
+      settings,
+      {
+        questionKind: 'choice',
+        contextQuestionText: payload.questionText,
+        contextOptions: payload.options,
+      }
     );
     if (visionResult.hostOnlyBlank) {
       return {
@@ -465,6 +719,7 @@ async function handleQuestionResolution(
       stateHash: payload.stateHash,
       questionIndex: payload.questionIndex,
       indices: visionResult.indices,
+      questionKind: 'choice',
       tier: 'tier4_vision',
       latencyMs: visionResult.latencyMs,
       timestamp: Date.now(),
@@ -496,7 +751,9 @@ async function handleExplicitVisionFallback(
   optionCount: number,
   multiSelect: boolean,
   tabId: number | undefined,
-  windowId: number | undefined
+  windowId: number | undefined,
+  questionKind?: QuestionKind,
+  blankLengthHint?: number
 ): Promise<RuntimeResolveResponse> {
   const settings = await getFastSettings();
   if (!settings.enabled) {
@@ -511,7 +768,11 @@ async function handleExplicitVisionFallback(
       windowId,
       optionCount,
       multiSelect,
-      settings
+      settings,
+      {
+        questionKind,
+        blankLengthHint,
+      }
     );
     if (visionResult.hostOnlyBlank) {
       return {
@@ -522,11 +783,14 @@ async function handleExplicitVisionFallback(
       };
     }
 
+    const isFill = questionKind === 'fill_blank' && Boolean(visionResult.fillText);
     const resolution = attachTriggerSettings(
       {
         stateHash,
         questionIndex,
         indices: visionResult.indices,
+        fillText: visionResult.fillText,
+        questionKind: isFill ? 'fill_blank' : 'choice',
         tier: 'tier4_vision',
         latencyMs: visionResult.latencyMs,
         timestamp: Date.now(),
@@ -537,10 +801,13 @@ async function handleExplicitVisionFallback(
 
     if (
       settings.triggerMode === 'instant_auto_click' &&
-      !multiSelect &&
       typeof tabId === 'number'
     ) {
-      void executeTrustedClickInTab(tabId, resolution.indices, false, false);
+      if (isFill && resolution.fillText) {
+        void executeTrustedTextFillInTab(tabId, resolution.fillText, true);
+      } else if (!multiSelect && resolution.indices.length > 0) {
+        void executeTrustedClickInTab(tabId, resolution.indices, false, false);
+      }
     }
 
     void Promise.all([
@@ -551,7 +818,10 @@ async function handleExplicitVisionFallback(
         lastQuestionHash: stateHash,
         lastError: null,
       }),
-      setBadgeFeedback(visionResult.indices.join(','), '#9333EA'),
+      setBadgeFeedback(
+        isFill ? 'TXT' : visionResult.indices.join(','),
+        '#9333EA'
+      ),
     ]);
 
     return { ok: true, resolution };
@@ -569,7 +839,9 @@ async function handleClipboardVisionRequest(
   optionCount: number,
   multiSelect: boolean,
   tabId: number | undefined,
-  directPayload?: ClipboardExtractedPayload
+  directPayload?: ClipboardExtractedPayload,
+  questionKind?: QuestionKind,
+  blankLengthHint?: number
 ): Promise<RuntimeResolveResponse> {
   const settings = await getFastSettings();
   if (!settings.enabled) {
@@ -585,15 +857,28 @@ async function handleClipboardVisionRequest(
           directPayload,
           optionCount,
           multiSelect,
-          settings
+          settings,
+          questionKind,
+          blankLengthHint
         )
-      : await resolveViaSystemClipboard(optionCount, multiSelect, settings);
+      : await resolveViaSystemClipboard(
+          optionCount,
+          multiSelect,
+          settings,
+          questionKind,
+          blankLengthHint
+        );
+
+    const isFill =
+      questionKind === 'fill_blank' && Boolean(clipboardResult.fillText);
 
     const resolution = attachTriggerSettings(
       {
         stateHash,
         questionIndex,
         indices: clipboardResult.indices,
+        fillText: clipboardResult.fillText,
+        questionKind: isFill ? 'fill_blank' : 'choice',
         tier: 'tier4_clipboard',
         latencyMs: clipboardResult.latencyMs,
         timestamp: Date.now(),
@@ -604,10 +889,13 @@ async function handleClipboardVisionRequest(
 
     if (
       settings.triggerMode === 'instant_auto_click' &&
-      !multiSelect &&
       typeof tabId === 'number'
     ) {
-      void executeTrustedClickInTab(tabId, resolution.indices, false, false);
+      if (isFill && resolution.fillText) {
+        void executeTrustedTextFillInTab(tabId, resolution.fillText, true);
+      } else if (!multiSelect && resolution.indices.length > 0) {
+        void executeTrustedClickInTab(tabId, resolution.indices, false, false);
+      }
     }
 
     void Promise.all([
@@ -618,7 +906,10 @@ async function handleClipboardVisionRequest(
         lastQuestionHash: stateHash,
         lastError: null,
       }),
-      setBadgeFeedback(clipboardResult.indices.join(','), '#EA580C'),
+      setBadgeFeedback(
+        isFill ? 'TXT' : clipboardResult.indices.join(','),
+        '#EA580C'
+      ),
     ]);
 
     return { ok: true, resolution };
@@ -678,10 +969,19 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     void detachDebuggerFromTab(tabId);
   }
 
+  let isSupportedHost = false;
+  try {
+    const host = new URL(candidateUrl).hostname.toLowerCase();
+    isSupportedHost = isKahootHostname(host) || isWaygroundHostname(host);
+  } catch {
+    isSupportedHost = false;
+  }
+
   const shouldWarmup =
     candidateUrl.includes('play.kahoot.it/v2/lobby') ||
     candidateUrl.includes('kahoot.it/instructions') ||
     candidateUrl.includes('kahoot.it/join') ||
+    (isSupportedHost && candidateUrl.includes('/join')) ||
     isKahootActiveGameplayUrl(candidateUrl);
 
   if (shouldWarmup) {
@@ -758,9 +1058,14 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
           type: 'APPLY_RESOLVED_ANSWER',
           resolution: result.resolution,
         });
+        const label =
+          result.resolution.questionKind === 'fill_blank' &&
+          result.resolution.fillText
+            ? `"${result.resolution.fillText}"`
+            : `[${result.resolution.indices.join(', ')}]`;
         await sendContentPushSafe(targetTab.id, {
           type: 'CLIPBOARD_STATUS_TOAST',
-          message: `⚡ Clipboard → [${result.resolution.indices.join(', ')}] (${result.resolution.latencyMs}ms)`,
+          message: `⚡ Clipboard → ${label} (${result.resolution.latencyMs}ms)`,
         });
       } else {
         await sendContentPushSafe(targetTab.id, {
@@ -844,12 +1149,22 @@ chrome.runtime.onMessage.addListener(
           sendResponse(clickRes);
           break;
         }
+        case 'EXEC_DIRECT_TEXT_FILL': {
+          const fillRes = await executeTrustedTextFillInTab(
+            sender.tab?.id,
+            runtimeMsg.fillText,
+            runtimeMsg.autoSubmit
+          );
+          sendResponse(fillRes);
+          break;
+        }
         case 'LEARN_VERIFIED_ANSWER': {
           await recordLearnedAnswer(
             runtimeMsg.questionText,
             runtimeMsg.options,
             runtimeMsg.indices,
-            true
+            true,
+            runtimeMsg.fillText
           );
           sendResponse({ ok: true });
           break;
@@ -863,7 +1178,9 @@ chrome.runtime.onMessage.addListener(
             runtimeMsg.optionCount,
             runtimeMsg.multiSelect,
             targetTab?.id,
-            targetTab?.windowId
+            targetTab?.windowId,
+            runtimeMsg.questionKind,
+            runtimeMsg.blankLengthHint
           );
           sendResponse(res);
           break;
@@ -876,7 +1193,10 @@ chrome.runtime.onMessage.addListener(
             runtimeMsg.questionIndex,
             runtimeMsg.optionCount,
             runtimeMsg.multiSelect,
-            targetTab?.id
+            targetTab?.id,
+            undefined,
+            runtimeMsg.questionKind,
+            runtimeMsg.blankLengthHint
           );
           sendResponse(res);
           break;
@@ -888,7 +1208,9 @@ chrome.runtime.onMessage.addListener(
             runtimeMsg.optionCount,
             runtimeMsg.multiSelect,
             sender.tab?.id,
-            runtimeMsg.clipboard
+            runtimeMsg.clipboard,
+            runtimeMsg.questionKind,
+            runtimeMsg.blankLengthHint
           );
           sendResponse(res);
           break;

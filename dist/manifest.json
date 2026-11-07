@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "KahootHybridEngine",
-  "version": "1.0.0",
-  "description": "Real-time 4-tier hybrid quiz detection and low-latency answer resolution engine for Kahoot.",
+  "version": "1.1.0",
+  "description": "Real-time 4-tier hybrid quiz detection and Multi-AI consensus engine for Kahoot and Wayground (Quizizz).",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
@@ -35,6 +35,12 @@
     "https://kahoot.it/*",
     "https://play.kahoot.it/*",
     "https://create.kahoot.it/*",
+    "https://wayground.com/*",
+    "https://*.wayground.com/*",
+    "https://quizizz.com/*",
+    "https://*.quizizz.com/*",
+    "https://joinmyquiz.com/*",
+    "https://*.joinmyquiz.com/*",
     "https://api.groq.com/*",
     "https://generativelanguage.googleapis.com/*",
     "https://openrouter.ai/*",
@@ -45,7 +51,13 @@
       "matches": [
         "https://kahoot.it/*",
         "https://play.kahoot.it/*",
-        "https://create.kahoot.it/*"
+        "https://create.kahoot.it/*",
+        "https://wayground.com/*",
+        "https://*.wayground.com/*",
+        "https://quizizz.com/*",
+        "https://*.quizizz.com/*",
+        "https://joinmyquiz.com/*",
+        "https://*.joinmyquiz.com/*"
       ],
       "js": ["content/injector.js"],
       "run_at": "document_start",
@@ -56,7 +68,13 @@
       "matches": [
         "https://kahoot.it/*",
         "https://play.kahoot.it/*",
-        "https://create.kahoot.it/*"
+        "https://create.kahoot.it/*",
+        "https://wayground.com/*",
+        "https://*.wayground.com/*",
+        "https://quizizz.com/*",
+        "https://*.quizizz.com/*",
+        "https://joinmyquiz.com/*",
+        "https://*.joinmyquiz.com/*"
       ],
       "js": ["content/content.js"],
       "run_at": "document_start",
