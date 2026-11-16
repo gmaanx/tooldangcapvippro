@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "KahootHybridEngine",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Real-time Multi-AI consensus engine for Kahoot, Wayground (Quizizz), and Highlight-Only Universal LMS & custom quizzes.",
   "icons": {
     "16": "icons/icon-16.png",
@@ -98,7 +98,7 @@
         "https://*.joinmyquiz.com/*"
       ],
       "js": ["content/universal-lms.js"],
-      "run_at": "document_idle",
+      "run_at": "document_end",
       "all_frames": true,
       "world": "ISOLATED"
     }

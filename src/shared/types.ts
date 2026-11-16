@@ -66,8 +66,40 @@ export interface QuestionPayload {
   hasQuestionImage?: boolean;
   deepAccuracy?: boolean;
   forceRefresh?: boolean;
+  pageContext?: string;
   imageBase64?: string;
   imageMimeType?: 'image/webp' | 'image/png' | 'image/jpeg';
+}
+
+export interface BatchQuestionItem {
+  stateHash: string;
+  questionIndex: number;
+  questionText: string;
+  options: string[];
+  multiSelect: boolean;
+  optionCount: number;
+}
+
+export interface BatchQuestionPayload {
+  items: BatchQuestionItem[];
+  pageContext?: string;
+  forceRefresh?: boolean;
+}
+
+export interface BatchItemResolution {
+  stateHash: string;
+  questionIndex: number;
+  indices: number[];
+  tier: ResolutionTier;
+  latencyMs: number;
+  voteSummary?: string;
+  disputed?: boolean;
+}
+
+export interface RuntimeBatchResolveResponse {
+  ok: boolean;
+  resolutions?: BatchItemResolution[];
+  error?: string;
 }
 
 export interface AnswerResolution {
@@ -186,6 +218,10 @@ export type RuntimeRequestMessage =
       payload: QuestionPayload;
     }
   | {
+      type: 'RESOLVE_QUESTION_BATCH';
+      payload: BatchQuestionPayload;
+    }
+  | {
       type: 'BROADCAST_HOST_QUESTION';
       payload: QuestionPayload;
     }
@@ -277,6 +313,11 @@ export type ContentPushMessage =
     }
   | {
       type: 'APPLY_RESOLVED_ANSWER';
+      resolution: AnswerResolution;
+    }
+  | {
+      type: 'APPLY_ARBITER_RESOLUTION';
+      stateHash: string;
       resolution: AnswerResolution;
     }
   | {

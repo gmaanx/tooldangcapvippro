@@ -136,6 +136,7 @@ export const MODELS = {
     'qwen/qwen3.8-27b',
   ],
   GEMINI_PRIMARY: 'gemini-3.8-flash',
+  GEMINI_PRO_ARBITER: 'gemini-4-argon',
   OPENROUTER_TEXT_CANDIDATES: [
     'qwen/qwen3-235b-a22b:free',
     'deepseek/deepseek-chat-v3-0324:free',
@@ -154,6 +155,8 @@ export const INFERENCE_TIMEOUT_MS = 3_600;
 export const DEEP_INFERENCE_TIMEOUT_MS = 14_000;
 export const CONSENSUS_DECISION_WINDOW_MS = 900;
 export const DEEP_CONSENSUS_WINDOW_MS = 5_500;
+export const BATCH_CHUNK_SIZE = 6;
+export const MAX_PARALLEL_BATCH_CHUNKS = 5;
 export const DEFAULT_QUESTION_TIMER_MS = 20_000;
 export const TARGET_SCORE_MIN = 600;
 export const TARGET_SCORE_MAX = 1_000;

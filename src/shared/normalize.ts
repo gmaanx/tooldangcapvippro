@@ -262,6 +262,73 @@ export function parseAnswerIndices(
   return [];
 }
 
+export function parseBatchAnswerMap(
+  rawOutput: string,
+  items: Array<{ optionCount: number; multiSelect: boolean }>
+): Map<number, number[]> {
+  const result = new Map<number, number[]>();
+  if (!rawOutput || items.length === 0) {
+    return result;
+  }
+
+  const withoutThink = rawOutput
+    .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
+    .replace(/<think>[\s\S]*$/gi, ' ');
+
+  const tagRegex = /<<\s*Q(\d+)\s*:\s*([^>]+?)>>/gi;
+  for (const match of withoutThink.matchAll(tagRegex)) {
+    const qIdx = Number.parseInt(match[1] ?? '', 10);
+    if (!Number.isInteger(qIdx) || qIdx < 0 || qIdx >= items.length) {
+      continue;
+    }
+    const spec = items[qIdx];
+    const upperBound = Math.max(1, Math.min(spec.optionCount, 12)) - 1;
+    const rawTokens =
+      (match[2] ?? '').match(/\b(?:1[01]|[0-9]|[A-La-l])\b/g) ?? [];
+    const parsed = collectBoundedIndicesFromTokens(
+      rawTokens,
+      upperBound,
+      spec.multiSelect,
+      true
+    );
+    if (parsed.length > 0) {
+      result.set(qIdx, parsed);
+    }
+  }
+
+  if (result.size === items.length) {
+    return result;
+  }
+
+  const lineRegex =
+    /(?:^|\n)\s*(?:\[?Q(\d+)\]?)\s*(?:->|:|=|-)\s*\[?\s*((?:(?:1[01]|[0-9])(?:\s*,\s*(?:1[01]|[0-9]))*))\s*\]?\s*(?:$|\n)/gi;
+  for (const match of withoutThink.matchAll(lineRegex)) {
+    const qIdx = Number.parseInt(match[1] ?? '', 10);
+    if (
+      !Number.isInteger(qIdx) ||
+      qIdx < 0 ||
+      qIdx >= items.length ||
+      result.has(qIdx)
+    ) {
+      continue;
+    }
+    const spec = items[qIdx];
+    const upperBound = Math.max(1, Math.min(spec.optionCount, 12)) - 1;
+    const tokens = (match[2] ?? '').match(/\b(?:1[01]|[0-9])\b/g) ?? [];
+    const parsed = collectBoundedIndicesFromTokens(
+      tokens,
+      upperBound,
+      spec.multiSelect,
+      false
+    );
+    if (parsed.length > 0) {
+      result.set(qIdx, parsed);
+    }
+  }
+
+  return result;
+}
+
 export function parseFillBlankAnswer(
   rawOutput: string,
   expectedLength?: number

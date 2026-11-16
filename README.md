@@ -24,7 +24,7 @@ The engine operates as a four-tier resolution pipeline designed to minimize late
 
 2. **Tier 2 — Platform Interceptors, Universal LMS Scanner & Scoped CDP Dispatcher**
    - **Kahoot & Wayground:** Intercepts Kahoot CometD WebSocket frames, installs a `document_start` Wayground focus guard (`Anti Focus-Loss`), computes inverse score-decay delays (`Target Score Pacing`), and dispatches hardware-level mouse clicks (`Input.dispatchMouseEvent`) and text insertion (`Input.insertText`) over Chrome DevTools Protocol (`1.3`).
-   - **Universal LMS & Custom Websites (`universal-lms.ts`):** Runs an isolated multi-adapter extractor covering Moodle (`div.que`), Canvas (`.display_question`), Google Forms, Microsoft Forms, native `<input type="radio"|"checkbox">` groups, ARIA `[role="radiogroup"]` components, and custom lecturer quiz cards. Prioritizes viewport-visible questions with concurrency throttling and enforces a hard **Highlight-Only** boundary so `chrome.debugger` never attaches outside Kahoot and Wayground.
+   - **Universal LMS & Custom Websites (`universal-lms.ts`):** Runs at `document_end` with automatic course breadcrumb grounding (`pageContext`), pre-warming TLS connections on quiz lobby pages, and dispatching multi-question exams in concurrent super-batches (`6` questions/batch, up to `30` questions simultaneously in `~1.0-1.8s`). Any non-unanimous question automatically triggers a secondary **Surgical Arbiter** pass (`gemini-4-argon` / `gemini-3.8-flash` high-thinking + `gpt-oss-120b` + `qwen3.8-27b`) while enforcing a hard **Highlight-Only** boundary (`chrome.debugger` never attaches outside Kahoot and Wayground).
 
 3. **Tier 3 — Multi-Provider AI Consensus Engine**
    - Executes concurrent low-latency inference across **Groq**, **Google Gemini**, and **OpenRouter**, spanning distinct model families (`Llama-4`, `Qwen-3`, `Gemini Flash`, `DeepSeek`) for both indexed choices (`0-11`) and exact-string fill-in-the-blank prompts.
@@ -194,7 +194,7 @@ Chromium restricts each tab to a single active debugger session. Keep the `F12` 
 │       ├── normalize.ts         # Hostname matchers, text/blank parsers, FNV-1a hashing & score math
 │       ├── storage.ts           # Persistent storage helpers for chrome.storage.local/session
 │       └── types.ts             # Strict TypeScript interfaces and message contracts
-├── manifest.json                # Chrome Extension Manifest V3 declaration (v1.2.0)
+├── manifest.json                # Chrome Extension Manifest V3 declaration (v1.3.0)
 ├── package.json                 # Build scripts and dependencies
 ├── tsconfig.json                # Strict TypeScript compiler configuration
 └── vite.config.ts               # Multi-entry Vite bundler (Popup, Service Worker, Content IIFEs)

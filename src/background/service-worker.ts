@@ -16,11 +16,15 @@ import {
 } from '../shared/storage';
 import type {
   AnswerResolution,
+  BatchItemResolution,
+  BatchQuestionItem,
+  BatchQuestionPayload,
   ClipboardExtractedPayload,
   ContentPushMessage,
   EngineSettings,
   QuestionKind,
   QuestionPayload,
+  RuntimeBatchResolveResponse,
   RuntimeCacheResponse,
   RuntimeClickResponse,
   RuntimeRequestMessage,
@@ -28,7 +32,12 @@ import type {
   RuntimeScanResponse,
   RuntimeStatusResponse,
 } from '../shared/types';
-import { raceParallelInference, warmupProviderConnections } from './ai-racer';
+import {
+  raceBatchChoiceInference,
+  raceParallelInference,
+  runSurgicalArbiterVerification,
+  warmupProviderConnections,
+} from './ai-racer';
 import {
   resolveFromClipboardPayload,
   resolveViaSystemClipboard,
@@ -73,10 +82,15 @@ async function getFastSettings(): Promise<EngineSettings> {
 
 async function sendContentPushSafe(
   tabId: number,
-  message: ContentPushMessage
+  message: ContentPushMessage,
+  frameId?: number
 ): Promise<void> {
   try {
-    await chrome.tabs.sendMessage(tabId, message);
+    if (typeof frameId === 'number') {
+      await chrome.tabs.sendMessage(tabId, message, { frameId });
+    } else {
+      await chrome.tabs.sendMessage(tabId, message);
+    }
   } catch {
     return;
   }
@@ -419,6 +433,178 @@ async function broadcastResolutionToPlayerTabs(
     }
   } catch {
     return;
+  }
+}
+
+async function handleBatchQuestionResolution(
+  payload: BatchQuestionPayload,
+  senderTabId: number | undefined,
+  senderFrameId: number | undefined
+): Promise<RuntimeBatchResolveResponse> {
+  const settings = await getFastSettings();
+  if (!settings.enabled) {
+    return {
+      ok: false,
+      error: 'KahootHybridEngine is currently paused.',
+    };
+  }
+  if (!Array.isArray(payload.items) || payload.items.length === 0) {
+    return { ok: true, resolutions: [] };
+  }
+
+  const startedAt = performance.now();
+  const requireVerified = Boolean(payload.forceRefresh);
+  const resolvedMap = new Map<string, BatchItemResolution>();
+  const uncachedItems: BatchQuestionItem[] = [];
+
+  for (const item of payload.items) {
+    const tier1 = await lookupTier1Cache(item.questionText, item.options);
+    if (tier1 && tier1.length > 0) {
+      resolvedMap.set(item.stateHash, {
+        stateHash: item.stateHash,
+        questionIndex: item.questionIndex,
+        indices: tier1,
+        tier: 'tier1_cache',
+        latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      });
+      continue;
+    }
+
+    const learned = await lookupLearnedCache(
+      item.questionText,
+      item.options,
+      requireVerified
+    );
+    if (learned && learned.length > 0) {
+      resolvedMap.set(item.stateHash, {
+        stateHash: item.stateHash,
+        questionIndex: item.questionIndex,
+        indices: learned,
+        tier: 'tier1_learned',
+        latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      });
+      continue;
+    }
+
+    uncachedItems.push(item);
+  }
+
+  if (uncachedItems.length === 0) {
+    return {
+      ok: true,
+      resolutions: payload.items
+        .map((it) => resolvedMap.get(it.stateHash))
+        .filter((x): x is BatchItemResolution => Boolean(x)),
+    };
+  }
+
+  try {
+    const batchOutcomes = await raceBatchChoiceInference(
+      uncachedItems,
+      payload.pageContext,
+      settings
+    );
+
+    const disputedOutcomes = batchOutcomes.filter(
+      (o) => o.resolution.disputed || o.resolution.indices.length === 0
+    );
+
+    for (const outcome of batchOutcomes) {
+      if (outcome.resolution.indices.length > 0) {
+        resolvedMap.set(outcome.item.stateHash, outcome.resolution);
+        if (
+          !outcome.resolution.disputed &&
+          outcome.resolution.tier === 'tier3_consensus'
+        ) {
+          void recordLearnedAnswer(
+            outcome.item.questionText,
+            outcome.item.options,
+            outcome.resolution.indices,
+            false
+          );
+        }
+      }
+    }
+
+    const orderedFast = payload.items
+      .map((it) => resolvedMap.get(it.stateHash))
+      .filter((x): x is BatchItemResolution => Boolean(x));
+
+    if (orderedFast.length > 0) {
+      const sample = orderedFast[orderedFast.length - 1];
+      void updateTelemetry({
+        lastTier: sample.tier,
+        lastLatencyMs: sample.latencyMs,
+        lastIndices: sample.indices,
+        lastQuestionHash: sample.stateHash,
+        lastError: null,
+      });
+    }
+
+    if (disputedOutcomes.length > 0 && typeof senderTabId === 'number') {
+      void (async () => {
+        for (const disputed of disputedOutcomes) {
+          const verified = await runSurgicalArbiterVerification(
+            {
+              questionText: disputed.item.questionText,
+              options: disputed.item.options,
+              multiSelect: disputed.item.multiSelect,
+              optionCount: disputed.item.optionCount,
+            },
+            disputed.competingCandidates,
+            payload.pageContext,
+            settings
+          );
+          if (verified && verified.indices.length > 0) {
+            if (verified.tier === 'tier3_consensus') {
+              void recordLearnedAnswer(
+                disputed.item.questionText,
+                disputed.item.options,
+                verified.indices,
+                false
+              );
+            }
+            const overrideRes = attachTriggerSettings(
+              {
+                stateHash: disputed.item.stateHash,
+                questionIndex: disputed.item.questionIndex,
+                indices: verified.indices,
+                questionKind: 'choice',
+                tier: verified.tier,
+                latencyMs: verified.latencyMs,
+                timestamp: Date.now(),
+                voteSummary: verified.voteSummary,
+              },
+              settings,
+              disputed.item.multiSelect,
+              true
+            );
+            await sendContentPushSafe(
+              senderTabId,
+              {
+                type: 'APPLY_ARBITER_RESOLUTION',
+                stateHash: disputed.item.stateHash,
+                resolution: overrideRes,
+              },
+              senderFrameId
+            );
+          }
+        }
+      })();
+    }
+
+    return {
+      ok: true,
+      resolutions: orderedFast,
+    };
+  } catch (err) {
+    const errorMsg =
+      err instanceof Error ? err.message : 'Batch AI resolution failed';
+    void updateTelemetry({ lastError: errorMsg });
+    return {
+      ok: false,
+      error: errorMsg,
+    };
   }
 }
 
@@ -1287,6 +1473,7 @@ chrome.runtime.onMessage.addListener(
     sendResponse: (
       response:
         | RuntimeResolveResponse
+        | RuntimeBatchResolveResponse
         | RuntimeCacheResponse
         | RuntimeStatusResponse
         | RuntimeClickResponse
@@ -1310,6 +1497,15 @@ chrome.runtime.onMessage.addListener(
             sender.tab?.url
           );
           sendResponse(res);
+          break;
+        }
+        case 'RESOLVE_QUESTION_BATCH': {
+          const batchRes = await handleBatchQuestionResolution(
+            runtimeMsg.payload,
+            sender.tab?.id,
+            sender.frameId
+          );
+          sendResponse(batchRes);
           break;
         }
         case 'BROADCAST_HOST_QUESTION': {

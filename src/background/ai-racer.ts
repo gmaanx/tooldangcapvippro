@@ -13,11 +13,14 @@ import {
   computeFnv1aHash,
   normalizeQuestionText,
   parseAnswerIndices,
+  parseBatchAnswerMap,
   parseFillBlankAnswer,
 } from '../shared/normalize';
 import { updateTelemetry } from '../shared/storage';
 import type {
   AiProviderId,
+  BatchItemResolution,
+  BatchQuestionItem,
   EngineSettings,
   QuestionPayload,
   ResolutionTier,
@@ -36,6 +39,8 @@ export interface RaceResult {
   >;
   latencyMs: number;
   voteSummary?: string;
+  disputed?: boolean;
+  competingIndices?: number[][];
 }
 
 interface ChromeLanguageModelSession {
@@ -599,23 +604,42 @@ export async function selectGroqVisionModel(
   return null;
 }
 
+function formatCombinedAcademicContext(
+  pinnedContext: string,
+  pageContext?: string
+): string {
+  const parts: string[] = [];
+  if (pageContext && pageContext.trim().length > 0) {
+    parts.push(`Course & Exam Subject: ${pageContext.trim()}`);
+  }
+  if (pinnedContext && pinnedContext.trim().length > 0) {
+    parts.push(`Reference Lecture Notes:\n${pinnedContext.trim()}`);
+  }
+  return parts.join('\n\n');
+}
+
 export function buildQuizSystemInstruction(
   multiSelect: boolean,
   optionCount: number,
   pinnedContext: string,
-  deepAccuracy = false
+  deepAccuracy = false,
+  pageContext?: string
 ): string {
   const maxIndex = Math.max(1, optionCount) - 1;
   let baseDirective: string;
 
   if (deepAccuracy) {
+    const shuffleRule =
+      'CRITICAL LMS SHUFFLE RULE: Platforms like Moodle shuffle option positions, so options phrased "All of the above" / "Tất cả các câu trên đều đúng" / "Tất cả đều đúng" / "None of the above" / "Tất cả đều sai" may appear at ANY index (even [0]) and refer to all the other substantive options in the question; options like "Both A and B" / "Cả A và B đều đúng" refer to [0] (Option A) and [1] (Option B) as listed.';
+
     baseDirective = multiSelect
       ? [
           'You are a rigorous university professor and deterministic exam solver.',
           'Carefully analyze every word of the question and each option [0] (Option A) through [' +
             maxIndex +
             '].',
-          'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options (such as "Both A and B" / "Cả A và B đều đúng" / "All of the above").',
+          'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, CHỈ, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options.',
+          shuffleRule,
           'First write a concise 2 to 4 sentence verification evaluating the statements and computing any formula step-by-step.',
           'Then on the VERY LAST LINE output the exact tag <<ANSWER: i,j>> containing ONLY the zero-based integer indices (0 to ' +
             maxIndex +
@@ -626,7 +650,8 @@ export function buildQuizSystemInstruction(
           'Carefully analyze every word of the question and each option [0] (Option A) through [' +
             maxIndex +
             '].',
-          'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options (such as "Both A and B" / "Cả A và B đều đúng" / "All of the above" / "None of the above").',
+          'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, CHỈ, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options.',
+          shuffleRule,
           'First write a concise 2 to 4 sentence verification evaluating each candidate option and computing any formula step-by-step.',
           'Then on the VERY LAST LINE output the exact tag <<ANSWER: k>> where k is the single best zero-based integer index from 0 to ' +
             maxIndex +
@@ -638,12 +663,15 @@ export function buildQuizSystemInstruction(
       : `You are an expert deterministic quiz solver. Carefully check negations (NOT/EXCEPT), exact terminology, and sequence order. Identify the single best option and output ONLY its zero-based integer index (an integer from 0 to ${maxIndex}). Output strictly the digit with zero words, punctuation, or explanation.`;
   }
 
-  const trimmedContext = pinnedContext.trim();
-  if (!trimmedContext) {
+  const combinedContext = formatCombinedAcademicContext(
+    pinnedContext,
+    pageContext
+  );
+  if (!combinedContext) {
     return baseDirective;
   }
 
-  return `${baseDirective}\n\nReference Context (ground your answer in these notes first):\n${trimmedContext}`;
+  return `${baseDirective}\n\n${combinedContext}`;
 }
 
 function buildQuizUserPrompt(payload: QuestionPayload): string {
@@ -1180,6 +1208,8 @@ async function executeWeightedConsensusRace(
       let decisionWindowTimer: ReturnType<typeof setTimeout> | null = null;
       const errors: Error[] = [];
       const buckets = new Map<string, VoteBucket>();
+      const distinctTiers = new Set(voters.map((v) => v.tier)).size;
+      const settledTiers = new Set<RaceResult['tier']>();
 
       const getRankedBuckets = (): VoteBucket[] => {
         return Array.from(buckets.values()).sort((a, b) => {
@@ -1208,6 +1238,11 @@ async function executeWeightedConsensusRace(
         }
         const best = ranked[0];
         const isConsensus = best.count >= 2;
+        const isDisputed =
+          deepAccuracy &&
+          (validVoteCount < 2 ||
+            ranked.length > 1 ||
+            best.count / Math.max(1, validVoteCount) < 0.75);
         resolve({
           indices: best.indices,
           tier: isConsensus ? 'tier3_consensus' : best.tier,
@@ -1215,6 +1250,8 @@ async function executeWeightedConsensusRace(
           voteSummary: isConsensus
             ? `${best.count}/${Math.max(best.count, validVoteCount)}`
             : undefined,
+          disputed: isDisputed,
+          competingIndices: ranked.slice(0, 3).map((b) => b.indices),
         });
       };
 
@@ -1227,6 +1264,7 @@ async function executeWeightedConsensusRace(
             }
             settledCount += 1;
             validVoteCount += 1;
+            settledTiers.add(voter.tier);
 
             const latencyNow = Math.round(performance.now() - startedAt);
             const key = buildVoteKey(indices, multiSelect);
@@ -1250,7 +1288,10 @@ async function executeWeightedConsensusRace(
             const remainingVoters = Math.max(0, voters.length - settledCount);
 
             if (deepAccuracy) {
+              const crossProviderReady =
+                distinctTiers < 2 || settledTiers.size >= 2;
               if (
+                crossProviderReady &&
                 top &&
                 top.count >= 2 &&
                 top.count > runnerUpCount + remainingVoters
@@ -1530,7 +1571,8 @@ export async function raceCustomPromptInference(
 export function buildFillBlankSystemInstruction(
   blankLengthHint: number | undefined,
   pinnedContext: string,
-  deepAccuracy = false
+  deepAccuracy = false,
+  pageContext?: string
 ): string {
   const lengthRule =
     typeof blankLengthHint === 'number' && blankLengthHint > 0
@@ -1540,11 +1582,14 @@ export function buildFillBlankSystemInstruction(
     ? `You are a rigorous university professor solving a Fill-in-the-Blank / Numerical / Short-Answer exam question.${lengthRule} First verify any formula, unit conversion, or rounding requirement concisely in 2 to 3 sentences. Then on the VERY LAST LINE output <<ANSWER: exact_value>> containing ONLY the exact number, word, or concise phrase (with no surrounding quotes or units unless requested).`
     : `You are an expert deterministic quiz solver for Fill-in-the-Blank and Short-Answer questions. Output ONLY the exact missing word, number, symbol, or concise phrase that answers the question.${lengthRule} Output zero explanation, zero surrounding quotes, zero markdown, and zero trailing period.`;
 
-  const trimmedContext = pinnedContext.trim();
-  if (!trimmedContext) {
+  const combinedContext = formatCombinedAcademicContext(
+    pinnedContext,
+    pageContext
+  );
+  if (!combinedContext) {
     return baseDirective;
   }
-  return `${baseDirective}\n\nReference Context (ground your answer in these notes first):\n${trimmedContext}`;
+  return `${baseDirective}\n\n${combinedContext}`;
 }
 
 async function runGroqFillBlankWithFallback(
@@ -2285,6 +2330,707 @@ export async function raceCustomFillBlankInference(
   }
 }
 
+async function runGeminiArbiterCompletion(
+  systemInstruction: string,
+  userPrompt: string,
+  optionCount: number,
+  multiSelect: boolean,
+  apiKey: string,
+  signal: AbortSignal,
+  imageBase64?: string,
+  imageMimeType?: string
+): Promise<{ indices: number[]; usedProModel: boolean }> {
+  const inputPayload =
+    imageBase64 && imageBase64.length > 0
+      ? [
+          { type: 'text', text: userPrompt },
+          {
+            type: 'image',
+            data: imageBase64,
+            mime_type: imageMimeType ?? 'image/webp',
+          },
+        ]
+      : userPrompt;
+
+  try {
+    const proRes = await fetch(API_ENDPOINTS.GEMINI_INTERACTIONS, {
+      method: 'POST',
+      signal,
+      headers: {
+        'x-goog-api-key': apiKey,
+        'Content-Type': 'application/json',
+        'Api-Revision': GEMINI_API_REVISION,
+      },
+      body: JSON.stringify({
+        model: MODELS.GEMINI_PRO_ARBITER,
+        store: false,
+        system_instruction: systemInstruction,
+        input: inputPayload,
+        generation_config: {
+          thinking_level: 'medium',
+          seed: 0,
+        },
+      }),
+    });
+
+    if (proRes.ok) {
+      const proJson = (await proRes.json()) as GeminiInteractionResponse;
+      const proText = extractGeminiInteractionText(proJson);
+      const proIndices = parseAnswerIndices(proText, optionCount, multiSelect);
+      if (proIndices.length > 0) {
+        return { indices: proIndices, usedProModel: true };
+      }
+    }
+  } catch {
+    void 0;
+  }
+
+  const flashIndices = await runGeminiTextCompletion(
+    systemInstruction,
+    userPrompt,
+    optionCount,
+    multiSelect,
+    apiKey,
+    signal,
+    true,
+    imageBase64,
+    imageMimeType
+  );
+  return { indices: flashIndices, usedProModel: false };
+}
+
+export async function runSurgicalArbiterVerification(
+  item: {
+    questionText: string;
+    options: string[];
+    multiSelect: boolean;
+    optionCount: number;
+    imageBase64?: string;
+    imageMimeType?: 'image/webp' | 'image/png' | 'image/jpeg';
+  },
+  competingCandidates: number[][],
+  pageContext: string | undefined,
+  settings: EngineSettings
+): Promise<RaceResult | null> {
+  const startedAt = performance.now();
+  const safeOptionCount = Math.max(
+    2,
+    item.optionCount || item.options.length || 4
+  );
+  const maxIndex = safeOptionCount - 1;
+  const combinedContext = formatCombinedAcademicContext(
+    settings.pinnedContext,
+    pageContext
+  );
+
+  const flatCandidates = Array.from(
+    new Set(competingCandidates.flat().filter((i) => i >= 0 && i <= maxIndex))
+  );
+  const disputeNote =
+    flatCandidates.length >= 2
+      ? `DISPUTE ALERT: An initial AI panel split between indices [${flatCandidates
+          .map((i) => `${i} (Option ${String.fromCharCode(65 + i)})`)
+          .join(' vs ')}]. Perform a Devil's-Advocate audit comparing every word of those candidates AND all other options to expose any subtle distractor trap.`
+      : `CRITICAL AUDIT: Perform an exhaustive textbook & mathematical audit of every option before locking the final answer.`;
+
+  const arbiterSystem = [
+    'You are the Chief University Exam Arbiter resolving a high-stakes disputed question.',
+    disputeNote,
+    '1. Check exact textbook definitions, ceteris paribus assumptions, short-run vs long-run distinctions, signs/exponents, units, and step-by-step math.',
+    '2. Check Vietnamese/English negations (KHÔNG, SAI, NGOẠI TRỪ, CHỈ, NOT, EXCEPT, FALSE).',
+    '3. Remember Moodle shuffles options: "Tất cả các câu trên đều đúng" / "All of the above" / "Tất cả đều đúng" at ANY position (even [0]) refers to all the other substantive options in the question; "Cả A và B đều đúng" refers to [0] (Option A) and [1] (Option B) as displayed.',
+    '4. Write a rigorous 3 to 5 sentence step-by-step proof eliminating false options, then on the VERY LAST LINE output strictly ' +
+      (item.multiSelect
+        ? `<<ANSWER: i,j>> with all correct zero-based indices (0 to ${maxIndex}).`
+        : `<<ANSWER: k>> with the single verified zero-based index (0 to ${maxIndex}).`),
+    combinedContext ? `\n${combinedContext}` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const formattedChoices = item.options
+    .map((opt, idx) => `[${idx}] (Option ${String.fromCharCode(65 + idx)}): ${opt}`)
+    .join('\n');
+  const arbiterUserPrompt = `Question:\n${item.questionText}\n\nOptions:\n${formattedChoices}`;
+
+  const voters: ConsensusVoterSpec[] = [];
+  const hasImage = Boolean(item.imageBase64 && item.imageBase64.length > 0);
+
+  if (
+    settings.geminiApiKey.length > 0 &&
+    !isProviderKeyMuted('gemini', settings.geminiApiKey)
+  ) {
+    voters.push({
+      id: 'arbiter-gemini',
+      tier: 'tier3_gemini',
+      weight: 1.92,
+      run: async (signal) => {
+        const res = await runGeminiArbiterCompletion(
+          arbiterSystem,
+          arbiterUserPrompt,
+          safeOptionCount,
+          item.multiSelect,
+          settings.geminiApiKey,
+          signal,
+          item.imageBase64,
+          item.imageMimeType
+        );
+        return res.indices;
+      },
+    });
+  }
+
+  if (
+    settings.groqApiKey.length > 0 &&
+    !isProviderKeyMuted('groq', settings.groqApiKey)
+  ) {
+    const groqArbiterModels = await pickDistinctGroqConsensusModels(
+      settings.groqApiKey,
+      2,
+      true
+    );
+    groqArbiterModels.forEach((modelId, idx) => {
+      const siblings = groqArbiterModels.filter((_, j) => j !== idx);
+      voters.push({
+        id: `arbiter-groq-${idx}`,
+        tier: 'tier3_groq',
+        weight: computeGroqModelWeight(modelId),
+        run: (signal) =>
+          runGroqTextCompletionWithFallback(
+            arbiterSystem,
+            arbiterUserPrompt,
+            safeOptionCount,
+            item.multiSelect,
+            settings.groqApiKey,
+            signal,
+            modelId,
+            siblings,
+            true
+          ),
+      });
+    });
+  }
+
+  if (
+    !hasImage &&
+    settings.openRouterApiKey.length > 0 &&
+    !isProviderKeyMuted('openrouter', settings.openRouterApiKey)
+  ) {
+    voters.push({
+      id: 'arbiter-openrouter',
+      tier: 'tier3_openrouter',
+      weight: 1.48,
+      run: (signal) =>
+        runOpenRouterTextCompletionWithFallback(
+          arbiterSystem,
+          arbiterUserPrompt,
+          safeOptionCount,
+          item.multiSelect,
+          settings.openRouterApiKey,
+          signal,
+          true
+        ),
+    });
+  }
+
+  if (voters.length === 0) {
+    return null;
+  }
+
+  try {
+    return await executeWeightedConsensusRace(
+      voters,
+      item.multiSelect,
+      startedAt,
+      true
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function runSingleVoterBatchCall(
+  provider: AiProviderId,
+  apiKey: string,
+  assignedGroqModel: string | undefined,
+  groqExclusions: string[],
+  systemInstruction: string,
+  userPrompt: string,
+  items: BatchQuestionItem[],
+  signal: AbortSignal
+): Promise<Map<number, number[]>> {
+  const specs = items.map((it) => ({
+    optionCount: Math.max(2, it.optionCount || it.options.length || 4),
+    multiSelect: it.multiSelect,
+  }));
+
+  if (provider === 'gemini') {
+    const response = await fetch(API_ENDPOINTS.GEMINI_INTERACTIONS, {
+      method: 'POST',
+      signal,
+      headers: {
+        'x-goog-api-key': apiKey,
+        'Content-Type': 'application/json',
+        'Api-Revision': GEMINI_API_REVISION,
+      },
+      body: JSON.stringify({
+        model: MODELS.GEMINI_PRIMARY,
+        store: false,
+        system_instruction: systemInstruction,
+        input: userPrompt,
+        generation_config: {
+          thinking_level: 'medium',
+          seed: 0,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errMsg = `Gemini Batch HTTP ${response.status}`;
+      recordProviderAuthFailure('gemini', apiKey, response.status, errMsg);
+      throw new Error(errMsg);
+    }
+
+    const json = (await response.json()) as GeminiInteractionResponse;
+    const text = extractGeminiInteractionText(json);
+    const map = parseBatchAnswerMap(text, specs);
+    if (map.size === 0) {
+      throw new Error('Gemini Batch returned zero parsed tags');
+    }
+    return map;
+  }
+
+  if (provider === 'groq') {
+    const excluded = new Set<string>([
+      'llama-3.1-8b-instant',
+      ...groqExclusions,
+    ]);
+    let lastErr = 'Groq Batch failed';
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const modelId = await selectGroqTextModel(
+        apiKey,
+        excluded,
+        attempt > 0,
+        attempt === 0 ? assignedGroqModel : undefined
+      );
+      const maxTokens = isReasoningModel(modelId) ? 2200 : 950;
+      const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
+        method: 'POST',
+        signal,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: modelId,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0,
+          max_tokens: maxTokens,
+          stream: false,
+        }),
+      });
+
+      if (!response.ok) {
+        lastErr = `Groq Batch HTTP ${response.status}`;
+        if (response.status === 401 || response.status === 403) {
+          recordProviderAuthFailure('groq', apiKey, response.status, lastErr);
+          throw new Error(lastErr);
+        }
+        excluded.add(modelId);
+        if (response.status === 429) {
+          await sleepAbortable(650, signal);
+        }
+        continue;
+      }
+
+      const json = (await response.json()) as OpenAiChatResponse;
+      const content = extractOpenAiMessageText(
+        json.choices?.[0]?.message?.content
+      );
+      const map = parseBatchAnswerMap(content, specs);
+      if (map.size > 0) {
+        return map;
+      }
+      excluded.add(modelId);
+    }
+    throw new Error(lastErr);
+  }
+
+  const keyHash = computeFnv1aHash(apiKey);
+  const candidates: string[] = [];
+  if (verifiedOpenRouterModel && verifiedOpenRouterModel.keyHash === keyHash) {
+    candidates.push(verifiedOpenRouterModel.modelId);
+  }
+  for (const m of MODELS.OPENROUTER_TEXT_CANDIDATES) {
+    if (!candidates.includes(m)) {
+      candidates.push(m);
+    }
+  }
+
+  let lastErr = 'OpenRouter Batch failed';
+  for (let attempt = 0; attempt < Math.min(2, candidates.length); attempt += 1) {
+    const modelId = candidates[attempt];
+    const response = await fetch(API_ENDPOINTS.OPENROUTER_CHAT_COMPLETIONS, {
+      method: 'POST',
+      signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://kahoot.it',
+        'X-Title': 'KahootHybridEngine',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0,
+        max_tokens: 1800,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      lastErr = `OpenRouter Batch HTTP ${response.status}`;
+      if (response.status === 401 || response.status === 403) {
+        recordProviderAuthFailure(
+          'openrouter',
+          apiKey,
+          response.status,
+          lastErr
+        );
+        throw new Error(lastErr);
+      }
+      continue;
+    }
+
+    const json = (await response.json()) as OpenAiChatResponse;
+    const content = extractOpenAiMessageText(
+      json.choices?.[0]?.message?.content
+    );
+    const map = parseBatchAnswerMap(content, specs);
+    if (map.size > 0) {
+      verifiedOpenRouterModel = { keyHash, modelId };
+      return map;
+    }
+  }
+  throw new Error(lastErr);
+}
+
+export interface BatchVoteOutcome {
+  item: BatchQuestionItem;
+  resolution: BatchItemResolution;
+  competingCandidates: number[][];
+}
+
+export async function raceBatchChoiceInference(
+  items: BatchQuestionItem[],
+  pageContext: string | undefined,
+  settings: EngineSettings
+): Promise<BatchVoteOutcome[]> {
+  if (items.length === 0) {
+    return [];
+  }
+  const startedAt = performance.now();
+  const combinedContext = formatCombinedAcademicContext(
+    settings.pinnedContext,
+    pageContext
+  );
+
+  const systemInstruction = [
+    `You are a rigorous university professor solving a batch of ${items.length} exam questions (Q0 through Q${items.length - 1}).`,
+    'For EVERY question Qi:',
+    '1. Carefully check negations (KHÔNG, NGOẠI TRỪ, SAI, CHỈ, NOT, EXCEPT, FALSE), exact textbook definitions, formulas, exponents, tables, and units.',
+    '2. CRITICAL LMS SHUFFLE RULE: Platforms like Moodle shuffle option positions, so "Tất cả các câu trên đều đúng" / "All of the above" / "Tất cả đều đúng" / "None of the above" at ANY index (even [0]) refers to all the other substantive options in that question; "Cả A và B đều đúng" refers to [0] (Option A) and [1] (Option B) as listed.',
+    '3. Write ONE concise verification line per question, ending that line with the exact tag <<Qi: index>> (or <<Qi: i,j>> if marked MULTI-SELECT) using ONLY zero-based integer indices. Example:',
+    'Q0: Brief check of formula/definitions -> <<Q0: 2>>',
+    'Q1: Brief check of statements -> <<Q1: 0>>',
+    combinedContext ? `\n${combinedContext}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const promptBlocks = items.map((it, localIdx) => {
+    const modeTag = it.multiSelect ? 'MULTI-SELECT' : 'SINGLE-CHOICE';
+    const opts = it.options
+      .map(
+        (opt, oIdx) =>
+          `  [${oIdx}] (Option ${String.fromCharCode(65 + oIdx)}): ${opt}`
+      )
+      .join('\n');
+    return `=== Q${localIdx} (${modeTag}) ===\n${it.questionText}\nOptions:\n${opts}`;
+  });
+  const userPrompt = promptBlocks.join('\n\n');
+
+  interface BatchVoter {
+    provider: AiProviderId;
+    tier: Extract<
+      ResolutionTier,
+      'tier3_groq' | 'tier3_gemini' | 'tier3_openrouter'
+    >;
+    weight: number;
+    run: (signal: AbortSignal) => Promise<Map<number, number[]>>;
+  }
+
+  const voters: BatchVoter[] = [];
+  const hasGemini =
+    settings.geminiApiKey.length > 0 &&
+    !isProviderKeyMuted('gemini', settings.geminiApiKey);
+  const hasOpenRouter =
+    settings.openRouterApiKey.length > 0 &&
+    !isProviderKeyMuted('openrouter', settings.openRouterApiKey);
+  const hasGroq =
+    settings.groqApiKey.length > 0 &&
+    !isProviderKeyMuted('groq', settings.groqApiKey);
+
+  if (hasGemini) {
+    voters.push({
+      provider: 'gemini',
+      tier: 'tier3_gemini',
+      weight: 1.72,
+      run: (signal) =>
+        runSingleVoterBatchCall(
+          'gemini',
+          settings.geminiApiKey,
+          undefined,
+          [],
+          systemInstruction,
+          userPrompt,
+          items,
+          signal
+        ),
+    });
+  }
+
+  if (hasGroq) {
+    const nonGroq = (hasGemini ? 1 : 0) + (hasOpenRouter ? 1 : 0);
+    const desiredGroq = nonGroq >= 2 ? 2 : 3;
+    const groqModels = await pickDistinctGroqConsensusModels(
+      settings.groqApiKey,
+      desiredGroq,
+      true
+    );
+    groqModels.forEach((modelId, idx) => {
+      const siblings = groqModels.filter((_, j) => j !== idx);
+      voters.push({
+        provider: 'groq',
+        tier: 'tier3_groq',
+        weight: computeGroqModelWeight(modelId),
+        run: (signal) =>
+          runSingleVoterBatchCall(
+            'groq',
+            settings.groqApiKey,
+            modelId,
+            siblings,
+            systemInstruction,
+            userPrompt,
+            items,
+            signal
+          ),
+      });
+    });
+  }
+
+  if (hasOpenRouter) {
+    voters.push({
+      provider: 'openrouter',
+      tier: 'tier3_openrouter',
+      weight: 1.44,
+      run: (signal) =>
+        runSingleVoterBatchCall(
+          'openrouter',
+          settings.openRouterApiKey,
+          undefined,
+          [],
+          systemInstruction,
+          userPrompt,
+          items,
+          signal
+        ),
+    });
+  }
+
+  if (voters.length === 0) {
+    throw new Error(
+      'Configure at least one valid API key (Groq, Gemini, or OpenRouter) in Popup.'
+    );
+  }
+
+  const controllers = voters.map(() => new AbortController());
+  const timeoutHandle = setTimeout(() => {
+    controllers.forEach((c) => c.abort());
+  }, DEEP_INFERENCE_TIMEOUT_MS);
+
+  const perItemBuckets: Array<Map<string, VoteBucket>> = items.map(
+    () => new Map<string, VoteBucket>()
+  );
+  const perItemVoterCount: number[] = items.map(() => 0);
+
+  const distinctProviderCount = new Set(voters.map((v) => v.provider)).size;
+  const settledProviders = new Set<AiProviderId>();
+
+  try {
+    await new Promise<void>((resolve) => {
+      let settled = 0;
+      let windowTimer: ReturnType<typeof setTimeout> | null = null;
+      let done = false;
+
+      const finish = (): void => {
+        if (done) {
+          return;
+        }
+        done = true;
+        if (windowTimer !== null) {
+          clearTimeout(windowTimer);
+          windowTimer = null;
+        }
+        resolve();
+      };
+
+      const allItemsClinchedMajority = (): boolean => {
+        if (distinctProviderCount >= 2 && settledProviders.size < 2) {
+          return false;
+        }
+        const remainingVoters = Math.max(0, voters.length - settled);
+        for (let q = 0; q < items.length; q += 1) {
+          const buckets = Array.from(perItemBuckets[q].values()).sort(
+            (a, b) => b.count - a.count || b.totalWeight - a.totalWeight
+          );
+          const top = buckets[0];
+          const second = buckets[1]?.count ?? 0;
+          if (!top || top.count < 2 || top.count <= second + remainingVoters) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      voters.forEach((voter, vIdx) => {
+        void (async () => {
+          try {
+            const answerMap = await voter.run(controllers[vIdx].signal);
+            if (done) {
+              return;
+            }
+            settled += 1;
+            settledProviders.add(voter.provider);
+            const nowLat = Math.round(performance.now() - startedAt);
+
+            for (const [qIdx, indices] of answerMap.entries()) {
+              if (qIdx < 0 || qIdx >= items.length || indices.length === 0) {
+                continue;
+              }
+              perItemVoterCount[qIdx] += 1;
+              const key = buildVoteKey(indices, items[qIdx].multiSelect);
+              const existing = perItemBuckets[qIdx].get(key);
+              if (existing) {
+                existing.count += 1;
+                existing.totalWeight += voter.weight;
+              } else {
+                perItemBuckets[qIdx].set(key, {
+                  indices,
+                  count: 1,
+                  totalWeight: voter.weight,
+                  firstLatencyMs: nowLat,
+                  tier: voter.tier,
+                });
+              }
+            }
+
+            if (settled >= voters.length || allItemsClinchedMajority()) {
+              finish();
+              return;
+            }
+
+            if (
+              settled >= 2 &&
+              (distinctProviderCount < 2 || settledProviders.size >= 2) &&
+              windowTimer === null
+            ) {
+              windowTimer = setTimeout(finish, 3400);
+            } else if (settled >= 2 && windowTimer === null) {
+              windowTimer = setTimeout(finish, 5200);
+            }
+          } catch {
+            if (done) {
+              return;
+            }
+            settled += 1;
+            if (settled >= voters.length) {
+              finish();
+            }
+          }
+        })();
+      });
+    });
+  } finally {
+    clearTimeout(timeoutHandle);
+    controllers.forEach((c) => c.abort());
+  }
+
+  const totalLatencyMs = Math.round(performance.now() - startedAt);
+  const outcomes: BatchVoteOutcome[] = [];
+
+  for (let q = 0; q < items.length; q += 1) {
+    const item = items[q];
+    const ranked = Array.from(perItemBuckets[q].values()).sort((a, b) => {
+      if (b.count !== a.count) {
+        return b.count - a.count;
+      }
+      if (Math.abs(b.totalWeight - a.totalWeight) > 0.001) {
+        return b.totalWeight - a.totalWeight;
+      }
+      return a.firstLatencyMs - b.firstLatencyMs;
+    });
+
+    const totalValid = perItemVoterCount[q];
+    const top = ranked[0];
+
+    if (!top) {
+      outcomes.push({
+        item,
+        resolution: {
+          stateHash: item.stateHash,
+          questionIndex: item.questionIndex,
+          indices: [],
+          tier: 'tier3_groq',
+          latencyMs: totalLatencyMs,
+          disputed: true,
+        },
+        competingCandidates: [],
+      });
+      continue;
+    }
+
+    const isConsensus = top.count >= 2;
+    const isDisputed =
+      totalValid < 2 ||
+      ranked.length > 1 ||
+      top.count / Math.max(1, totalValid) < 0.75;
+
+    outcomes.push({
+      item,
+      resolution: {
+        stateHash: item.stateHash,
+        questionIndex: item.questionIndex,
+        indices: top.indices,
+        tier: isConsensus ? 'tier3_consensus' : top.tier,
+        latencyMs: totalLatencyMs,
+        voteSummary: isConsensus ? `${top.count}/${totalValid}` : undefined,
+        disputed: isDisputed,
+      },
+      competingCandidates: ranked.slice(0, 3).map((b) => b.indices),
+    });
+  }
+
+  return outcomes;
+}
+
 export async function raceParallelInference(
   payload: QuestionPayload,
   settings: EngineSettings
@@ -2297,7 +3043,8 @@ export async function raceParallelInference(
     const systemInstruction = buildFillBlankSystemInstruction(
       payload.blankLengthHint,
       settings.pinnedContext,
-      deepAccuracy
+      deepAccuracy,
+      payload.pageContext
     );
     const userPrompt = `Question:\n${payload.questionText}`;
     return raceCustomFillBlankInference(
@@ -2320,11 +3067,12 @@ export async function raceParallelInference(
     payload.multiSelect,
     optionCount,
     settings.pinnedContext,
-    deepAccuracy
+    deepAccuracy,
+    payload.pageContext
   );
   const userPrompt = buildQuizUserPrompt(payload);
 
-  return raceCustomPromptInference(
+  const primaryResult = await raceCustomPromptInference(
     systemInstruction,
     userPrompt,
     optionCount,
@@ -2335,6 +3083,30 @@ export async function raceParallelInference(
     payload.imageBase64,
     payload.imageMimeType
   );
+
+  if (deepAccuracy && primaryResult.disputed) {
+    const arbiterResult = await runSurgicalArbiterVerification(
+      {
+        questionText: payload.questionText,
+        options: payload.options,
+        multiSelect: payload.multiSelect,
+        optionCount,
+        imageBase64: payload.imageBase64,
+        imageMimeType: payload.imageMimeType,
+      },
+      primaryResult.competingIndices ?? [primaryResult.indices],
+      payload.pageContext,
+      settings
+    );
+    if (arbiterResult && arbiterResult.indices.length > 0) {
+      return {
+        ...arbiterResult,
+        latencyMs: Math.round(performance.now() - startedAt),
+      };
+    }
+  }
+
+  return primaryResult;
 }
 
 async function silentGet(

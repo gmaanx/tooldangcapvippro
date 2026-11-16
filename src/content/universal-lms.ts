@@ -1,5 +1,7 @@
 import {
+  BATCH_CHUNK_SIZE,
   DEFAULT_SETTINGS,
+  MAX_PARALLEL_BATCH_CHUNKS,
   STORAGE_KEYS,
   VISION_MAX_DIMENSION_PX,
   VISION_WEBP_QUALITY,
@@ -15,11 +17,13 @@ import {
 import { loadSettings } from '../shared/storage';
 import type {
   AnswerResolution,
+  BatchQuestionItem,
   ClipboardExtractedPayload,
   ContentPushMessage,
   EngineSettings,
   QuestionKind,
   QuestionPayload,
+  RuntimeBatchResolveResponse,
   RuntimeRequestMessage,
   RuntimeResolveResponse,
 } from '../shared/types';
@@ -43,6 +47,7 @@ interface UniversalQuestionBlock {
   questionText: string;
   options: string[];
   optionElements: HTMLElement[];
+  selectControl?: HTMLSelectElement;
   multiSelect: boolean;
   questionKind: QuestionKind;
   blankInputs: Array<HTMLInputElement | HTMLTextAreaElement>;
@@ -111,11 +116,10 @@ let scrollDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let hudToastHost: HTMLElement | null = null;
 let hudToastTextEl: HTMLElement | null = null;
 let hudToastTimer: ReturnType<typeof setTimeout> | null = null;
-let activeQueueWorkers = 0;
 
 const resolvedBlocks = new Map<string, ResolvedBlockRecord>();
+const stateHashToSig = new Map<string, string>();
 const inFlightSignatures = new Set<string>();
-const pendingQueue: UniversalQuestionBlock[] = [];
 const harvestedReviewHashes = new Set<string>();
 const styledElements = new Set<HTMLElement>();
 const styledInputs = new Set<HTMLInputElement | HTMLTextAreaElement>();
@@ -227,13 +231,49 @@ function extractRichMathText(
     ) {
       return ' ';
     }
-    if (tag === 'sup') {
+    if (tag === 'sup' || tag === 'msup') {
+      if (tag === 'msup' && el.children.length >= 2) {
+        const base = walk(el.children[0]).trim();
+        const exp = walk(el.children[1]).trim();
+        return `${base}^{${exp}}`;
+      }
       const innerSup = Array.from(el.childNodes).map(walk).join('').trim();
       return innerSup ? `^{${innerSup}}` : '';
     }
-    if (tag === 'sub') {
+    if (tag === 'sub' || tag === 'msub') {
+      if (tag === 'msub' && el.children.length >= 2) {
+        const base = walk(el.children[0]).trim();
+        const sub = walk(el.children[1]).trim();
+        return `${base}_{${sub}}`;
+      }
       const innerSub = Array.from(el.childNodes).map(walk).join('').trim();
       return innerSub ? `_{${innerSub}}` : '';
+    }
+    if (tag === 'msubsup' && el.children.length >= 3) {
+      const base = walk(el.children[0]).trim();
+      const sub = walk(el.children[1]).trim();
+      const sup = walk(el.children[2]).trim();
+      return `${base}_{${sub}}^{${sup}}`;
+    }
+    if (tag === 'mfrac' && el.children.length >= 2) {
+      const num = walk(el.children[0]).trim();
+      const den = walk(el.children[1]).trim();
+      return `((${num})/(${den}))`;
+    }
+    if (tag === 'msqrt') {
+      const innerSqrt = Array.from(el.childNodes).map(walk).join('').trim();
+      return `sqrt(${innerSqrt})`;
+    }
+    if (tag === 'math') {
+      const altTex =
+        el.getAttribute('alttext') ?? el.getAttribute('aria-label');
+      if (altTex && altTex.trim().length > 0) {
+        return ` ${altTex.trim()} `;
+      }
+      const annot = el.querySelector('annotation[encoding="application/x-tex"]');
+      if (annot?.textContent?.trim()) {
+        return ` ${annot.textContent.trim()} `;
+      }
     }
     if (el.classList.contains('katex')) {
       const texNode = el.querySelector('annotation[encoding="application/x-tex"]');
@@ -626,6 +666,56 @@ function extractMoodleBlocks(
       if (built) {
         claimedContainers.add(queEl);
         results.push(built);
+      }
+      continue;
+    }
+
+    const selectControls = Array.from(
+      queEl.querySelectorAll<HTMLSelectElement>(
+        '.answer select, .ablock select, .formulation select'
+      )
+    ).filter((sel) => isElementVisible(sel) && !sel.disabled);
+
+    if (selectControls.length >= 1 && selectControls.length <= 10) {
+      let addedSelect = false;
+      for (const sel of selectControls) {
+        const validOpts = Array.from(sel.options)
+          .filter(
+            (opt) =>
+              opt.value !== '' &&
+              !/^(?:choose|chọn|select)\b/i.test(opt.text.trim())
+          )
+          .map((opt) => opt.text.replace(/\s+/g, ' ').trim())
+          .filter((t) => t.length > 0);
+
+        if (validOpts.length < 2 || validOpts.length > 12) {
+          continue;
+        }
+        const rowCell = sel.closest('tr')?.querySelector<HTMLElement>('td.text');
+        const subPrompt = rowCell ? extractRichMathText(rowCell) : '';
+        const fullStem = subPrompt
+          ? `${stem}\nMatch target: ${subPrompt}`
+          : stem;
+        const placeholderEls = validOpts.map(() => sel as HTMLElement);
+        const built = buildBlockRecord(
+          queEl,
+          fullStem,
+          validOpts,
+          placeholderEls,
+          false,
+          'choice',
+          [],
+          startIndex + results.length
+        );
+        if (built) {
+          built.selectControl = sel;
+          claimedControls.add(sel);
+          results.push(built);
+          addedSelect = true;
+        }
+      }
+      if (addedSelect) {
+        claimedContainers.add(queEl);
       }
     }
   }
@@ -1236,6 +1326,64 @@ function extractUniversalQuestionBlocks(
   return allBlocks;
 }
 
+function extractPageAcademicContext(): string {
+  const genericNoise =
+    /^(?:bảng\s*điều\s*khiển|dashboard|trang\s*chủ(?:\s*hệ\s*thống)?|home|my\s*courses|các\s*khoá\s*học\s*của\s*tôi|các\s*khóa\s*học\s*của\s*tôi|courses|ueh\s*lms)$/i;
+
+  const crumbs = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      '.breadcrumb li, .breadcrumb a, #page-navbar li, #page-navbar a, nav[aria-label*="breadcrumb" i] li'
+    )
+  )
+    .map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim())
+    .filter((txt) => txt.length > 1 && txt.length < 120 && !genericNoise.test(txt));
+
+  const uniqueCrumbs: string[] = [];
+  for (const item of crumbs) {
+    if (!uniqueCrumbs.includes(item)) {
+      uniqueCrumbs.push(item);
+    }
+  }
+
+  const heading = (
+    document.querySelector<HTMLElement>(
+      '.page-header-headings h1, main h1, h1'
+    )?.textContent ?? ''
+  )
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (heading && !genericNoise.test(heading) && !uniqueCrumbs.includes(heading)) {
+    uniqueCrumbs.push(heading);
+  }
+
+  if (uniqueCrumbs.length > 0) {
+    return uniqueCrumbs.slice(-5).join(' > ');
+  }
+
+  const cleanTitle = (document.title ?? '').replace(/\s+/g, ' ').trim();
+  return cleanTitle.slice(0, 180);
+}
+
+function isKnownLmsEnvironment(): boolean {
+  const host = window.location.hostname.toLowerCase();
+  const href = window.location.href.toLowerCase();
+  return (
+    host.includes('lms.') ||
+    host.startsWith('lms') ||
+    host.includes('moodle') ||
+    host.includes('elearning') ||
+    host.includes('instructure.com') ||
+    host.includes('blackboard') ||
+    host.includes('azota') ||
+    host.includes('shub') ||
+    (host === 'docs.google.com' && href.includes('/forms/')) ||
+    host.includes('forms.office.com') ||
+    host.includes('forms.cloud.microsoft') ||
+    href.includes('/mod/quiz/')
+  );
+}
+
 function isHostBlocklistedForAutoScan(hostname: string): boolean {
   const lower = hostname.toLowerCase();
   return BLOCKLISTED_AUTO_DOMAINS.some(
@@ -1457,6 +1605,26 @@ function renderAllResolvedHighlights(): void {
     }
 
     const { block, resolution } = entry;
+    if (block.selectControl && document.body.contains(block.selectControl)) {
+      const sel = block.selectControl;
+      const winIdx = resolution.indices[0];
+      const winLabel =
+        typeof winIdx === 'number' ? block.options[winIdx] ?? '' : '';
+      if (winLabel) {
+        if (!isStealth) {
+          rememberOriginalBoxStyle(sel);
+          sel.style.outline = GOLD_OUTLINE_CSS;
+          sel.style.outlineOffset = '1px';
+        }
+        const badge = document.createElement('span');
+        badge.setAttribute('data-khe-lms-badge', isStealth ? 'stealth' : 'gold');
+        badge.setAttribute('aria-hidden', 'true');
+        badge.textContent = isStealth ? `(${winLabel})` : winLabel;
+        sel.insertAdjacentElement('afterend', badge);
+      }
+      continue;
+    }
+
     if (block.questionKind === 'fill_blank' && resolution.fillText) {
       const targetInput = block.blankInputs[0];
       if (!targetInput || !document.body.contains(targetInput)) {
@@ -1701,8 +1869,29 @@ async function extractEmbeddedImagesFromBlock(
   }
 }
 
+function hasContentImageCandidates(container: HTMLElement): boolean {
+  return Array.from(container.querySelectorAll<HTMLImageElement>('img')).some(
+    (img) => {
+      if (
+        img.closest('.outcome, .specificfeedback, [data-khe-lms-badge]') ||
+        img.classList.contains('icon') ||
+        img.classList.contains('emoticon') ||
+        Boolean(img.getAttribute('data-latex')?.trim()) ||
+        img.classList.contains('texrender')
+      ) {
+        return false;
+      }
+      const rect = img.getBoundingClientRect();
+      const w = Math.max(img.naturalWidth || 0, rect.width);
+      const h = Math.max(img.naturalHeight || 0, rect.height);
+      return w >= 36 && h >= 18;
+    }
+  );
+}
+
 async function resolveSingleUniversalBlock(
-  block: UniversalQuestionBlock
+  block: UniversalQuestionBlock,
+  pageContext: string
 ): Promise<boolean> {
   const embeddedImg = await extractEmbeddedImagesFromBlock(block.container);
   const payload: QuestionPayload = {
@@ -1718,9 +1907,12 @@ async function resolveSingleUniversalBlock(
     blankLengthHint: block.blankLengthHint,
     deepAccuracy: true,
     forceRefresh: Boolean(block.forceRefresh),
+    pageContext,
     imageBase64: embeddedImg?.base64,
     imageMimeType: embeddedImg?.mimeType,
   };
+
+  stateHashToSig.set(block.blockId, block.contentSig);
 
   const response = await sendRuntimeMessage<RuntimeResolveResponse>({
     type: 'RESOLVE_QUESTION',
@@ -1739,52 +1931,143 @@ async function resolveSingleUniversalBlock(
   return false;
 }
 
-function sortBlocksViewportFirst(
-  blocks: UniversalQuestionBlock[]
-): UniversalQuestionBlock[] {
-  const viewportHeight = window.innerHeight || 800;
-  return [...blocks].sort((a, b) => {
-    const aVisible = a.verticalTop >= -120 && a.verticalTop <= viewportHeight + 160;
-    const bVisible = b.verticalTop >= -120 && b.verticalTop <= viewportHeight + 160;
-    if (aVisible !== bVisible) {
-      return aVisible ? -1 : 1;
+async function resolveChoiceBatchChunk(
+  chunk: UniversalQuestionBlock[],
+  pageContext: string,
+  forceRefresh: boolean
+): Promise<void> {
+  if (chunk.length === 0) {
+    return;
+  }
+  if (chunk.length === 1) {
+    try {
+      await resolveSingleUniversalBlock(chunk[0], pageContext);
+    } finally {
+      inFlightSignatures.delete(chunk[0].contentSig);
     }
-    return a.verticalTop - b.verticalTop;
+    return;
+  }
+
+  const byHash = new Map<string, UniversalQuestionBlock>();
+  const batchItems: BatchQuestionItem[] = chunk.map((b, idx) => {
+    byHash.set(b.blockId, b);
+    stateHashToSig.set(b.blockId, b.contentSig);
+    return {
+      stateHash: b.blockId,
+      questionIndex: idx,
+      questionText: b.questionText,
+      options: b.options,
+      multiSelect: b.multiSelect,
+      optionCount: b.options.length,
+    };
   });
+
+  try {
+    const batchRes = await sendRuntimeMessage<RuntimeBatchResolveResponse>({
+      type: 'RESOLVE_QUESTION_BATCH',
+      payload: {
+        items: batchItems,
+        pageContext,
+        forceRefresh,
+      },
+    });
+
+    if (batchRes?.ok && Array.isArray(batchRes.resolutions)) {
+      const resolvedHashes = new Set<string>();
+      for (const itemRes of batchRes.resolutions) {
+        const matchedBlock = byHash.get(itemRes.stateHash);
+        if (matchedBlock && itemRes.indices.length > 0) {
+          resolvedHashes.add(itemRes.stateHash);
+          resolvedBlocks.set(matchedBlock.contentSig, {
+            block: matchedBlock,
+            resolution: {
+              stateHash: itemRes.stateHash,
+              questionIndex: itemRes.questionIndex,
+              indices: itemRes.indices,
+              questionKind: 'choice',
+              tier: itemRes.tier,
+              latencyMs: itemRes.latencyMs,
+              timestamp: Date.now(),
+              multiSelect: matchedBlock.multiSelect,
+              triggerMode: 'highlight_only',
+              highlightStyle: currentSettings.highlightStyle,
+              voteSummary: itemRes.voteSummary,
+            },
+          });
+        }
+      }
+      renderAllResolvedHighlights();
+
+      const missedBlocks = chunk.filter((b) => !resolvedHashes.has(b.blockId));
+      for (const missed of missedBlocks) {
+        await resolveSingleUniversalBlock(missed, pageContext);
+      }
+      return;
+    }
+
+    await Promise.all(
+      chunk.map((b) => resolveSingleUniversalBlock(b, pageContext))
+    );
+  } finally {
+    for (const b of chunk) {
+      inFlightSignatures.delete(b.contentSig);
+    }
+  }
 }
 
-function pumpResolutionQueue(): Promise<void> {
-  return new Promise((resolve) => {
-    const step = (): void => {
-      if (pendingQueue.length === 0 && activeQueueWorkers === 0) {
-        resolve();
-        return;
-      }
+async function dispatchTurboParallelResolution(
+  blocksToSolve: UniversalQuestionBlock[],
+  pageContext: string,
+  forceRefresh: boolean
+): Promise<void> {
+  const pureChoiceBlocks: UniversalQuestionBlock[] = [];
+  const individualBlocks: UniversalQuestionBlock[] = [];
 
-      while (
-        activeQueueWorkers < MAX_CONCURRENT_REQUESTS &&
-        pendingQueue.length > 0
-      ) {
-        const nextBlock = pendingQueue.shift()!;
-        activeQueueWorkers += 1;
-        void (async () => {
-          try {
-            await resolveSingleUniversalBlock(nextBlock);
-          } finally {
-            inFlightSignatures.delete(nextBlock.contentSig);
-            activeQueueWorkers -= 1;
-            if (pendingQueue.length > 0) {
-              setTimeout(step, 180);
-            } else {
-              step();
-            }
-          }
-        })();
-      }
-    };
+  for (const b of blocksToSolve) {
+    if (
+      b.questionKind === 'choice' &&
+      !hasContentImageCandidates(b.container)
+    ) {
+      pureChoiceBlocks.push(b);
+    } else {
+      individualBlocks.push(b);
+    }
+  }
 
-    step();
-  });
+  const chunks: UniversalQuestionBlock[][] = [];
+  for (let i = 0; i < pureChoiceBlocks.length; i += BATCH_CHUNK_SIZE) {
+    chunks.push(pureChoiceBlocks.slice(i, i + BATCH_CHUNK_SIZE));
+  }
+
+  const chunkTasks = async (): Promise<void> => {
+    for (let w = 0; w < chunks.length; w += MAX_PARALLEL_BATCH_CHUNKS) {
+      const wave = chunks.slice(w, w + MAX_PARALLEL_BATCH_CHUNKS);
+      await Promise.all(
+        wave.map((chunk) =>
+          resolveChoiceBatchChunk(chunk, pageContext, forceRefresh)
+        )
+      );
+    }
+  };
+
+  const individualTasks = async (): Promise<void> => {
+    let cursor = 0;
+    const workerCount = Math.min(MAX_CONCURRENT_REQUESTS, individualBlocks.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (cursor < individualBlocks.length) {
+        const current = individualBlocks[cursor];
+        cursor += 1;
+        try {
+          await resolveSingleUniversalBlock(current, pageContext);
+        } finally {
+          inFlightSignatures.delete(current.contentSig);
+        }
+      }
+    });
+    await Promise.all(workers);
+  };
+
+  await Promise.all([chunkTasks(), individualTasks()]);
 }
 
 async function solveSelectedTextIfPresent(): Promise<boolean> {
@@ -1928,6 +2211,20 @@ function highlightSubstringInContainer(
   }
 }
 
+function sortBlocksViewportFirst(
+  blocks: UniversalQuestionBlock[]
+): UniversalQuestionBlock[] {
+  const viewportHeight = window.innerHeight || 800;
+  return [...blocks].sort((a, b) => {
+    const aVisible = a.verticalTop >= -120 && a.verticalTop <= viewportHeight + 160;
+    const bVisible = b.verticalTop >= -120 && b.verticalTop <= viewportHeight + 160;
+    if (aVisible !== bVisible) {
+      return aVisible ? -1 : 1;
+    }
+    return a.verticalTop - b.verticalTop;
+  });
+}
+
 async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
   if (!currentSettings.enabled) {
     return { detectedCount: 0, solvedCount: 0 };
@@ -1954,13 +2251,15 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
     return { detectedCount: 0, solvedCount: 0 };
   }
 
+  const pageContext = extractPageAcademicContext();
   const ordered = sortBlocksViewportFirst(blocks);
-  let newlyQueued = 0;
+  const toDispatch: UniversalQuestionBlock[] = [];
 
   for (const block of ordered) {
     if (forceMode) {
       block.forceRefresh = true;
     }
+    stateHashToSig.set(block.blockId, block.contentSig);
     const existing = resolvedBlocks.get(block.contentSig);
     if (existing) {
       existing.block = block;
@@ -1970,17 +2269,16 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
       continue;
     }
     inFlightSignatures.add(block.contentSig);
-    pendingQueue.push(block);
-    newlyQueued += 1;
+    toDispatch.push(block);
   }
 
   renderAllResolvedHighlights();
 
-  if (newlyQueued > 0 || activeQueueWorkers > 0) {
+  if (toDispatch.length > 0) {
     if (forceMode) {
-      await pumpResolutionQueue();
+      await dispatchTurboParallelResolution(toDispatch, pageContext, true);
     } else {
-      void pumpResolutionQueue();
+      void dispatchTurboParallelResolution(toDispatch, pageContext, false);
     }
   }
 
@@ -2163,8 +2461,15 @@ function initializeUniversalLmsEngine(): void {
 
   void (async () => {
     currentSettings = await loadSettings();
-    if (currentSettings.enabled && currentSettings.universalHighlightEnabled) {
-      scheduleAutoEvaluation(180);
+    if (currentSettings.enabled) {
+      if (isKnownLmsEnvironment()) {
+        void sendRuntimeMessage<{ ok: boolean }>({
+          type: 'WARMUP_CONNECTIONS',
+        });
+      }
+      if (currentSettings.universalHighlightEnabled) {
+        scheduleAutoEvaluation(12);
+      }
     }
   })();
 
@@ -2205,6 +2510,34 @@ function initializeUniversalLmsEngine(): void {
           sendResponse({ ok: true });
         });
         return true;
+      }
+      if (
+        message?.type === 'APPLY_ARBITER_RESOLUTION' &&
+        message.stateHash &&
+        message.resolution
+      ) {
+        const sig = stateHashToSig.get(message.stateHash);
+        if (sig) {
+          const existing = resolvedBlocks.get(sig);
+          if (existing) {
+            existing.resolution = message.resolution;
+            renderAllResolvedHighlights();
+          } else {
+            const liveBlocks = extractUniversalQuestionBlocks(true);
+            const found = liveBlocks.find(
+              (b) => b.blockId === message.stateHash || b.contentSig === sig
+            );
+            if (found) {
+              resolvedBlocks.set(found.contentSig, {
+                block: found,
+                resolution: message.resolution,
+              });
+              renderAllResolvedHighlights();
+            }
+          }
+        }
+        sendResponse({ ok: true });
+        return false;
       }
       if (message?.type === 'APPLY_RESOLVED_ANSWER' && message.resolution) {
         const blocks = extractUniversalQuestionBlocks(true);
