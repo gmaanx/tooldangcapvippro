@@ -64,6 +64,10 @@ export interface QuestionPayload {
   questionKind?: QuestionKind;
   blankLengthHint?: number;
   hasQuestionImage?: boolean;
+  deepAccuracy?: boolean;
+  forceRefresh?: boolean;
+  imageBase64?: string;
+  imageMimeType?: 'image/webp' | 'image/png' | 'image/jpeg';
 }
 
 export interface AnswerResolution {

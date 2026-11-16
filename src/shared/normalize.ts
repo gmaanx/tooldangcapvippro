@@ -118,8 +118,52 @@ export function stripLeadingOptionPrefix(raw: string): string {
     return '';
   }
   return raw
-    .replace(/^\s*(?:\(?[A-La-l1-9]\)?[.):\-]\s+|(?:Option|Choice|Câu|Đáp án)\s+[A-La-l1-9][.):\-]?\s+)/i, '')
+    .replace(/^\s*(?:\([A-La-l]\)\s+|[A-La-l][.)]\s+)/, '')
     .trim();
+}
+
+function collectBoundedIndicesFromTokens(
+  tokens: Iterable<string>,
+  upperBound: number,
+  multiSelect: boolean,
+  allowLetterFallback = false
+): number[] {
+  const uniqueValid: number[] = [];
+  for (const rawToken of tokens) {
+    const trimmed = rawToken.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (/^\d+$/.test(trimmed)) {
+      const parsed = Number.parseInt(trimmed, 10);
+      if (
+        Number.isInteger(parsed) &&
+        parsed >= 0 &&
+        parsed <= upperBound &&
+        !uniqueValid.includes(parsed)
+      ) {
+        uniqueValid.push(parsed);
+        if (!multiSelect) {
+          return uniqueValid;
+        }
+      }
+      continue;
+    }
+    if (allowLetterFallback && /^[A-La-l]$/.test(trimmed)) {
+      const letterIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
+      if (
+        letterIdx >= 0 &&
+        letterIdx <= upperBound &&
+        !uniqueValid.includes(letterIdx)
+      ) {
+        uniqueValid.push(letterIdx);
+        if (!multiSelect) {
+          return uniqueValid;
+        }
+      }
+    }
+  }
+  return uniqueValid;
 }
 
 export function parseAnswerIndices(
@@ -131,32 +175,91 @@ export function parseAnswerIndices(
     return [];
   }
   const upperBound = Math.max(1, Math.min(optionCount, 12)) - 1;
-  const strippedThink = rawOutput
-    .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
-    .replace(/<think>[\s\S]*$/gi, ' ')
-    .trim();
-  const digitMatches = strippedThink.match(/\b(?:1[01]|[0-9])\b/g);
-  if (!digitMatches || digitMatches.length === 0) {
-    return [];
-  }
+  const withoutClosedThink = rawOutput.replace(
+    /<think>[\s\S]*?<\/think>/gi,
+    ' '
+  );
 
-  const uniqueValid: number[] = [];
-  for (const token of digitMatches) {
-    const parsed = Number.parseInt(token, 10);
-    if (
-      Number.isInteger(parsed) &&
-      parsed >= 0 &&
-      parsed <= upperBound &&
-      !uniqueValid.includes(parsed)
-    ) {
-      uniqueValid.push(parsed);
-      if (!multiSelect) {
-        break;
-      }
+  const tagPattern = /<<\s*(?:ANSWER|INDEX)\s*:\s*([^>]+?)>>/gi;
+  const tagMatches = Array.from(withoutClosedThink.matchAll(tagPattern));
+  if (tagMatches.length > 0) {
+    const lastPayload = tagMatches[tagMatches.length - 1][1] ?? '';
+    const rawTokens = lastPayload.match(/\b(?:1[01]|[0-9]|[A-La-l])\b/g) ?? [];
+    const fromTag = collectBoundedIndicesFromTokens(
+      rawTokens,
+      upperBound,
+      multiSelect,
+      true
+    );
+    if (fromTag.length > 0) {
+      return fromTag;
     }
   }
 
-  return uniqueValid;
+  const strippedThink = withoutClosedThink
+    .replace(/<think>[\s\S]*$/gi, ' ')
+    .trim();
+  if (!strippedThink) {
+    return [];
+  }
+
+  const labeledPattern =
+    /(?:final\s+answer|correct\s+(?:index|indices|option|options|answer)|answer|đáp\s+án(?:\s+đúng)?)\s*(?:is|là|:|=)\s*\[?\s*((?:(?:1[01]|[0-9])(?:\s*,\s*(?:1[01]|[0-9]))*))\s*\]?/gi;
+  const labeledMatches = Array.from(strippedThink.matchAll(labeledPattern));
+  if (labeledMatches.length > 0) {
+    const lastCapture = labeledMatches[labeledMatches.length - 1][1] ?? '';
+    const tokens = lastCapture.match(/\b(?:1[01]|[0-9])\b/g) ?? [];
+    const fromLabeled = collectBoundedIndicesFromTokens(
+      tokens,
+      upperBound,
+      multiSelect,
+      false
+    );
+    if (fromLabeled.length > 0) {
+      return fromLabeled;
+    }
+  }
+
+  if (
+    strippedThink.length <= 20 &&
+    /^[\s\[\]().,0-9]+$/.test(strippedThink)
+  ) {
+    const compactTokens = strippedThink.match(/\b(?:1[01]|[0-9])\b/g) ?? [];
+    return collectBoundedIndicesFromTokens(
+      compactTokens,
+      upperBound,
+      multiSelect,
+      false
+    );
+  }
+
+  const nonEmptyLines = strippedThink
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const tailLine = nonEmptyLines[nonEmptyLines.length - 1] ?? '';
+  const tailTokens = tailLine.match(/\b(?:1[01]|[0-9])\b/g) ?? [];
+  if (tailTokens.length > 0) {
+    if (!multiSelect) {
+      const lastToken = tailTokens[tailTokens.length - 1];
+      return collectBoundedIndicesFromTokens(
+        [lastToken],
+        upperBound,
+        false,
+        false
+      );
+    }
+    if (tailLine.length <= 36) {
+      return collectBoundedIndicesFromTokens(
+        tailTokens,
+        upperBound,
+        true,
+        false
+      );
+    }
+  }
+
+  return [];
 }
 
 export function parseFillBlankAnswer(
@@ -166,8 +269,33 @@ export function parseFillBlankAnswer(
   if (!rawOutput) {
     return '';
   }
-  let cleaned = rawOutput
-    .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
+  const withoutClosedThink = rawOutput.replace(
+    /<think>[\s\S]*?<\/think>/gi,
+    ' '
+  );
+  const tagMatches = Array.from(
+    withoutClosedThink.matchAll(/<<\s*ANSWER\s*:\s*([^>]+?)>>/gi)
+  );
+  if (tagMatches.length > 0) {
+    const tagged = (tagMatches[tagMatches.length - 1][1] ?? '')
+      .replace(/^["'`«“]+|["'`»”]+$/g, '')
+      .trim();
+    if (tagged.length > 0 && !/^none$/i.test(tagged)) {
+      if (
+        typeof expectedLength === 'number' &&
+        expectedLength > 0 &&
+        tagged.length !== expectedLength
+      ) {
+        const compact = tagged.replace(/\s+/g, '');
+        if (compact.length === expectedLength) {
+          return compact;
+        }
+      }
+      return tagged;
+    }
+  }
+
+  let cleaned = withoutClosedThink
     .replace(/<think>[\s\S]*$/gi, ' ')
     .replace(/```[\s\S]*?```/g, (block) =>
       block.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '')

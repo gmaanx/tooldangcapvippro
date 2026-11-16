@@ -438,6 +438,10 @@ async function handleQuestionResolution(
 
   const isExternalHighlightOnly =
     payload.platform === 'universal' || !isKahootPlayableUrl(senderTabUrl);
+  const effectivePayload: QuestionPayload = isExternalHighlightOnly
+    ? { ...payload, deepAccuracy: true }
+    : payload;
+  const requireVerifiedCache = Boolean(effectivePayload.forceRefresh);
 
   const finalizeResolution = (base: AnswerResolution): RuntimeResolveResponse => {
     const enriched = attachTriggerSettings(
@@ -467,8 +471,11 @@ async function handleQuestionResolution(
 
   const startedAt = performance.now();
 
-  if (payload.questionKind === 'fill_blank') {
-    const learnedFill = await lookupLearnedFillBlank(payload.questionText);
+  if (effectivePayload.questionKind === 'fill_blank') {
+    const learnedFill = await lookupLearnedFillBlank(
+      effectivePayload.questionText,
+      requireVerifiedCache
+    );
     if (learnedFill) {
       const latencyMs = Math.max(0, Math.round(performance.now() - startedAt));
       const resolution: AnswerResolution = {
@@ -548,21 +555,26 @@ async function handleQuestionResolution(
       }
     }
 
-    if (payload.questionText.trim().length > 0) {
+    if (effectivePayload.questionText.trim().length > 0) {
       try {
-        const raceWinner = await raceParallelInference(payload, settings);
+        const raceWinner = await raceParallelInference(
+          effectivePayload,
+          settings
+        );
         const answerText = raceWinner.fillText ?? '';
         if (!answerText) {
           return { ok: false, error: 'AI returned an empty fill-blank answer.' };
         }
 
-        void recordLearnedAnswer(
-          payload.questionText,
-          [],
-          [],
-          false,
-          answerText
-        );
+        if (!isExternalHighlightOnly || raceWinner.tier === 'tier3_consensus') {
+          void recordLearnedAnswer(
+            effectivePayload.questionText,
+            [],
+            [],
+            false,
+            answerText
+          );
+        }
 
         const resolution: AnswerResolution = {
           stateHash: payload.stateHash,
@@ -692,8 +704,9 @@ async function handleQuestionResolution(
   }
 
   const learnedIndices = await lookupLearnedCache(
-    payload.questionText,
-    payload.options
+    effectivePayload.questionText,
+    effectivePayload.options,
+    requireVerifiedCache
   );
 
   if (learnedIndices && learnedIndices.length > 0) {
@@ -783,7 +796,10 @@ async function handleQuestionResolution(
 
   if (hasReadableQuestion && hasReadableOptions) {
     try {
-      const raceWinner = await raceParallelInference(payload, settings);
+      const raceWinner = await raceParallelInference(
+        effectivePayload,
+        settings
+      );
       const resolution: AnswerResolution = {
         stateHash: payload.stateHash,
         questionIndex: payload.questionIndex,
@@ -795,12 +811,14 @@ async function handleQuestionResolution(
         voteSummary: raceWinner.voteSummary,
       };
 
-      void recordLearnedAnswer(
-        payload.questionText,
-        payload.options,
-        raceWinner.indices,
-        false
-      );
+      if (!isExternalHighlightOnly || raceWinner.tier === 'tier3_consensus') {
+        void recordLearnedAnswer(
+          effectivePayload.questionText,
+          effectivePayload.options,
+          raceWinner.indices,
+          false
+        );
+      }
 
       const badgeColor =
         raceWinner.tier === 'tier3_consensus' ? '#0284C7' : '#2563EB';

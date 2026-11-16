@@ -47,6 +47,7 @@ interface UniversalQuestionBlock {
   questionKind: QuestionKind;
   blankInputs: Array<HTMLInputElement | HTMLTextAreaElement>;
   blankLengthHint?: number;
+  forceRefresh?: boolean;
   verticalTop: number;
 }
 
@@ -222,9 +223,17 @@ function extractRichMathText(
       el.classList.contains('answernumber') ||
       el.classList.contains('specificfeedback') ||
       el.classList.contains('outcome') ||
-      el.classList.contains(' grade')
+      el.classList.contains('qtype_multichoice_clearchoice')
     ) {
       return ' ';
+    }
+    if (tag === 'sup') {
+      const innerSup = Array.from(el.childNodes).map(walk).join('').trim();
+      return innerSup ? `^{${innerSup}}` : '';
+    }
+    if (tag === 'sub') {
+      const innerSub = Array.from(el.childNodes).map(walk).join('').trim();
+      return innerSub ? `_{${innerSub}}` : '';
     }
     if (el.classList.contains('katex')) {
       const texNode = el.querySelector('annotation[encoding="application/x-tex"]');
@@ -264,26 +273,34 @@ function extractRichMathText(
       }
       return ' ';
     }
+    if (tag === 'br') {
+      return '\n';
+    }
 
     const parts: string[] = [];
     for (const child of Array.from(el.childNodes)) {
       parts.push(walk(child));
     }
-    const blockBreak =
+    if (tag === 'td' || tag === 'th') {
+      return ` ${parts.join('').replace(/\s+/g, ' ').trim()} | `;
+    }
+    if (
       tag === 'p' ||
       tag === 'div' ||
       tag === 'li' ||
-      tag === 'br' ||
       tag === 'tr' ||
       tag === 'pre'
-        ? ' '
-        : '';
-    return blockBreak + parts.join('') + blockBreak;
+    ) {
+      return `\n${parts.join('')}\n`;
+    }
+    return parts.join('');
   };
 
   return walk(root)
     .replace(MOODLE_NOISE_PREFIX_PATTERN, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
 
@@ -293,12 +310,16 @@ function cleanQuestionStemText(raw: string): string {
     .replace(/\s*\*\s*$/, '')
     .replace(/\s*\(\d+(?:[.,]\d+)?\s*(?:points?|pts|điểm)\)\s*$/i, '')
     .replace(/\s+\d+(?:[.,]\d+)?\s*(?:points?|pts|điểm)\s*$/i, '')
-    .replace(/\s+/g, ' ')
+    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
 
-function cleanOptionItemText(raw: string): string {
+function cleanOptionItemText(raw: string, stripPrefix = true): string {
   const collapsed = raw.replace(/\s+/g, ' ').trim();
+  if (!stripPrefix) {
+    return collapsed;
+  }
   const stripped = stripLeadingOptionPrefix(collapsed);
   return stripped.length > 0 ? stripped : collapsed;
 }
@@ -542,7 +563,14 @@ function extractMoodleBlocks(
       queEl.querySelectorAll<HTMLInputElement>(
         '.answer input[type="radio"], .answer input[type="checkbox"]'
       )
-    ).filter((inp) => inp.name && !inp.name.endsWith(':flagged'));
+    ).filter(
+      (inp) =>
+        Boolean(inp.name) &&
+        !inp.name.endsWith(':flagged') &&
+        inp.value !== '-1' &&
+        !inp.id.endsWith('_answer-1') &&
+        !inp.closest('.qtype_multichoice_clearchoice')
+    );
 
     if (choiceInputs.length >= 2 && choiceInputs.length <= 12) {
       const multiSelect = choiceInputs.some((inp) => inp.type === 'checkbox');
@@ -555,7 +583,7 @@ function extractMoodleBlocks(
         claimedControls.add(inp);
         const row = resolveOptionRowForControl(inp, boundary, choiceInputs);
         optionElements.push(row);
-        options.push(cleanOptionItemText(extractRichMathText(row)));
+        options.push(cleanOptionItemText(extractRichMathText(row), false));
       }
 
       harvestMoodleReviewVerifiedAnswer(queEl, stem, options);
@@ -908,7 +936,13 @@ function extractGenericControlGroupBlocks(
       'input[type="radio"], input[type="checkbox"]'
     )
   ).filter((inp) => {
-    if (claimedControls.has(inp) || inp.disabled) {
+    if (
+      claimedControls.has(inp) ||
+      inp.disabled ||
+      inp.value === '-1' ||
+      inp.id.endsWith('_answer-1') ||
+      inp.closest('.qtype_multichoice_clearchoice')
+    ) {
       return false;
     }
     if (isInsideExcludedPageChrome(inp)) {
@@ -1553,9 +1587,124 @@ function showDiscreteToast(message: string, isError = false, durationMs = 2400):
   }, durationMs);
 }
 
+async function extractEmbeddedImagesFromBlock(
+  container: HTMLElement
+): Promise<{
+  base64: string;
+  mimeType: 'image/webp';
+} | null> {
+  const imgs = Array.from(container.querySelectorAll<HTMLImageElement>('img')).filter(
+    (img) => {
+      if (
+        img.closest('.outcome, .specificfeedback, [data-khe-lms-badge]') ||
+        img.classList.contains('icon') ||
+        img.classList.contains('emoticon')
+      ) {
+        return false;
+      }
+      const hasFullLatex = Boolean(
+        img.getAttribute('data-latex')?.trim() ||
+          img.classList.contains('texrender')
+      );
+      if (hasFullLatex) {
+        return false;
+      }
+      const rect = img.getBoundingClientRect();
+      const w = Math.max(img.naturalWidth || 0, rect.width);
+      const h = Math.max(img.naturalHeight || 0, rect.height);
+      return w >= 36 && h >= 18;
+    }
+  );
+
+  if (imgs.length === 0) {
+    return null;
+  }
+
+  const bitmaps: ImageBitmap[] = [];
+  for (const img of imgs.slice(0, 3)) {
+    const src = img.currentSrc || img.src;
+    if (!src) {
+      continue;
+    }
+    try {
+      const resp = await fetch(src, { credentials: 'include' });
+      if (resp.ok) {
+        const blob = await resp.blob();
+        bitmaps.push(await createImageBitmap(blob));
+        continue;
+      }
+    } catch {
+      void 0;
+    }
+    try {
+      if (img.complete && img.naturalWidth > 0) {
+        bitmaps.push(await createImageBitmap(img));
+      }
+    } catch {
+      void 0;
+    }
+  }
+
+  if (bitmaps.length === 0) {
+    return null;
+  }
+
+  try {
+    const gap = 10;
+    const rawMaxW = Math.max(...bitmaps.map((b) => b.width));
+    const rawTotalH =
+      bitmaps.reduce((acc, b) => acc + b.height, 0) +
+      gap * Math.max(0, bitmaps.length - 1);
+    const scale = Math.min(1, 1100 / Math.max(rawMaxW, rawTotalH));
+    const canvasW = Math.max(1, Math.round(rawMaxW * scale));
+    const canvasH = Math.max(1, Math.round(rawTotalH * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = canvasW;
+    canvas.height = canvasH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      bitmaps.forEach((b) => b.close());
+      return null;
+    }
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvasW, canvasH);
+
+    let y = 0;
+    for (const bmp of bitmaps) {
+      const drawW = Math.max(1, Math.round(bmp.width * scale));
+      const drawH = Math.max(1, Math.round(bmp.height * scale));
+      ctx.drawImage(bmp, 0, y, drawW, drawH);
+      y += drawH + Math.round(gap * scale);
+      bmp.close();
+    }
+
+    const webpBlob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob((b) => resolve(b), 'image/webp', 0.76)
+    );
+    if (!webpBlob) {
+      return null;
+    }
+    return {
+      base64: encodeBytesToBase64(await webpBlob.arrayBuffer()),
+      mimeType: 'image/webp',
+    };
+  } catch {
+    bitmaps.forEach((b) => {
+      try {
+        b.close();
+      } catch {
+        void 0;
+      }
+    });
+    return null;
+  }
+}
+
 async function resolveSingleUniversalBlock(
   block: UniversalQuestionBlock
 ): Promise<boolean> {
+  const embeddedImg = await extractEmbeddedImagesFromBlock(block.container);
   const payload: QuestionPayload = {
     stateHash: block.blockId,
     questionIndex: 0,
@@ -1567,6 +1716,10 @@ async function resolveSingleUniversalBlock(
     platform: 'universal',
     questionKind: block.questionKind,
     blankLengthHint: block.blankLengthHint,
+    deepAccuracy: true,
+    forceRefresh: Boolean(block.forceRefresh),
+    imageBase64: embeddedImg?.base64,
+    imageMimeType: embeddedImg?.mimeType,
   };
 
   const response = await sendRuntimeMessage<RuntimeResolveResponse>({
@@ -1621,7 +1774,7 @@ function pumpResolutionQueue(): Promise<void> {
             inFlightSignatures.delete(nextBlock.contentSig);
             activeQueueWorkers -= 1;
             if (pendingQueue.length > 0) {
-              setTimeout(step, 95);
+              setTimeout(step, 180);
             } else {
               step();
             }
@@ -1789,6 +1942,7 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
     if (solvedSelection) {
       return { detectedCount: 1, solvedCount: 1 };
     }
+    resolvedBlocks.clear();
   }
 
   const blocks = extractUniversalQuestionBlocks(forceMode);
@@ -1804,6 +1958,9 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
   let newlyQueued = 0;
 
   for (const block of ordered) {
+    if (forceMode) {
+      block.forceRefresh = true;
+    }
     const existing = resolvedBlocks.get(block.contentSig);
     if (existing) {
       existing.block = block;

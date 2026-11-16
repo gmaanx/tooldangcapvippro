@@ -100,7 +100,8 @@ export async function getLearnedQuestionCount(): Promise<number> {
 
 export async function lookupLearnedCache(
   questionText: string,
-  liveOptions: string[]
+  liveOptions: string[],
+  verifiedOnly = false
 ): Promise<number[] | null> {
   await ensureLearnedCacheHydrated();
   if (learnedCache.size === 0) {
@@ -113,7 +114,7 @@ export async function lookupLearnedCache(
   }
 
   const entry = learnedCache.get(normQuestion);
-  if (!entry) {
+  if (!entry || (verifiedOnly && !entry.verified)) {
     return null;
   }
 
@@ -149,7 +150,8 @@ export async function lookupLearnedCache(
 }
 
 export async function lookupLearnedFillBlank(
-  questionText: string
+  questionText: string,
+  verifiedOnly = false
 ): Promise<string | null> {
   await ensureLearnedCacheHydrated();
   if (learnedCache.size === 0) {
@@ -160,7 +162,12 @@ export async function lookupLearnedFillBlank(
     return null;
   }
   const entry = learnedCache.get(normQuestion);
-  if (entry && typeof entry.fillText === 'string' && entry.fillText.trim().length > 0) {
+  if (
+    entry &&
+    (!verifiedOnly || entry.verified) &&
+    typeof entry.fillText === 'string' &&
+    entry.fillText.trim().length > 0
+  ) {
     return entry.fillText.trim();
   }
   return null;
@@ -582,16 +589,23 @@ export async function prefetchAndCacheQuiz(
 export async function clearTier1Cache(): Promise<void> {
   questionIndexCache.clear();
   questionChoiceTextCache.clear();
+  learnedCache.clear();
   failedQuizTimestamps.clear();
   activeCachedQuizId = '';
   isMemoryHydrated = true;
+  isLearnedHydrated = true;
   await Promise.all([
     clearSerializedQuizCache(),
+    chrome.storage.local.remove([
+      STORAGE_KEYS.LEARNED_CACHE_LOCAL,
+      'kahoot_hybrid_learned_cache',
+    ]),
     saveSettings({ quizId: '' }),
     updateTelemetry({
       cachedQuizId: '',
       cachedQuizTitle: '',
       cachedQuestionCount: 0,
+      learnedQuestionCount: 0,
       lastError: null,
     }),
   ]);

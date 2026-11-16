@@ -8,7 +8,7 @@ export const STORAGE_KEYS = {
   TELEMETRY: 'kahoot_hybrid_telemetry',
   QUIZ_CACHE_SESSION: 'kahoot_hybrid_quiz_cache_session',
   QUIZ_CACHE_LOCAL: 'kahoot_hybrid_quiz_cache_local',
-  LEARNED_CACHE_LOCAL: 'kahoot_hybrid_learned_cache',
+  LEARNED_CACHE_LOCAL: 'kahoot_hybrid_learned_cache_v2',
   GROQ_MODEL_CACHE: 'kahoot_hybrid_groq_models',
   OPENROUTER_MODEL_CACHE: 'kahoot_hybrid_openrouter_models',
   VISION_LOCK: 'kahoot_hybrid_vision_lock',
@@ -106,13 +106,13 @@ export const API_ENDPOINTS = {
 export const MODELS = {
   GROQ_PRIMARY: 'meta-llama/llama-4-scout-17b-16e-instruct',
   GROQ_TEXT_CANDIDATES: [
-    'meta-llama/llama-4-scout-17b-16e-instruct',
     'meta-llama/llama-4-maverick-17b-128e-instruct',
-    'qwen/qwen3.8-27b',
-    'llama-3.1-8b-instant',
-    'openai/gpt-oss-20b',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
     'openai/gpt-oss-120b',
     'llama-3.3-70b-versatile',
+    'qwen/qwen3.8-27b',
+    'openai/gpt-oss-20b',
+    'llama-3.1-8b-instant',
   ],
   GROQ_CONSENSUS_CANDIDATES: [
     'meta-llama/llama-4-maverick-17b-128e-instruct',
@@ -122,17 +122,25 @@ export const MODELS = {
     'llama-3.3-70b-versatile',
     'llama-3.1-8b-instant',
   ],
-  GROQ_VISION_CANDIDATES: [
-    'meta-llama/llama-4-scout-17b-16e-instruct',
+  GROQ_DEEP_ACCURACY_CANDIDATES: [
+    'openai/gpt-oss-120b',
+    'llama-3.3-70b-versatile',
     'meta-llama/llama-4-maverick-17b-128e-instruct',
+    'qwen/qwen3.8-27b',
+    'openai/gpt-oss-20b',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+  ],
+  GROQ_VISION_CANDIDATES: [
+    'meta-llama/llama-4-maverick-17b-128e-instruct',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
     'qwen/qwen3.8-27b',
   ],
   GEMINI_PRIMARY: 'gemini-3.8-flash',
   OPENROUTER_TEXT_CANDIDATES: [
-    'openrouter/free',
+    'qwen/qwen3-235b-a22b:free',
     'deepseek/deepseek-chat-v3-0324:free',
     'meta-llama/llama-4-maverick:free',
-    'qwen/qwen3-235b-a22b:free',
+    'openrouter/free',
   ],
 } as const;
 
@@ -143,7 +151,9 @@ export const HIGHLIGHT_OUTLINE_CSS = '2px solid rgba(255, 215, 0, 0.85)' as cons
 export const WARMUP_COOLDOWN_MS = 22_000;
 export const VISION_LOCK_TTL_MS = 4_500;
 export const INFERENCE_TIMEOUT_MS = 3_600;
+export const DEEP_INFERENCE_TIMEOUT_MS = 14_000;
 export const CONSENSUS_DECISION_WINDOW_MS = 900;
+export const DEEP_CONSENSUS_WINDOW_MS = 5_500;
 export const DEFAULT_QUESTION_TIMER_MS = 20_000;
 export const TARGET_SCORE_MIN = 600;
 export const TARGET_SCORE_MAX = 1_000;

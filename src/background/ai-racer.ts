@@ -1,6 +1,8 @@
 import {
   API_ENDPOINTS,
   CONSENSUS_DECISION_WINDOW_MS,
+  DEEP_CONSENSUS_WINDOW_MS,
+  DEEP_INFERENCE_TIMEOUT_MS,
   GEMINI_API_REVISION,
   INFERENCE_TIMEOUT_MS,
   MODELS,
@@ -433,13 +435,34 @@ export async function selectGroqTextModel(
   return MODELS.GROQ_PRIMARY;
 }
 
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const t = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(t);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 async function pickDistinctGroqConsensusModels(
   apiKey: string,
-  desiredCount: number
+  desiredCount: number,
+  deepAccuracy = false
 ): Promise<string[]> {
   await ensureGroqModelStateHydrated();
   const keyHash = computeFnv1aHash(apiKey);
   const picked: string[] = [];
+  const candidatePool = deepAccuracy
+    ? MODELS.GROQ_DEEP_ACCURACY_CANDIDATES
+    : MODELS.GROQ_CONSENSUS_CANDIDATES;
 
   if (
     groqModelState &&
@@ -449,7 +472,7 @@ async function pickDistinctGroqConsensusModels(
     const chatCapable = groqModelState.modelIds.filter(
       (id) => !NON_CHAT_MODEL_PATTERN.test(id)
     );
-    for (const candidate of MODELS.GROQ_CONSENSUS_CANDIDATES) {
+    for (const candidate of candidatePool) {
       if (chatCapable.includes(candidate) && !picked.includes(candidate)) {
         picked.push(candidate);
         if (picked.length >= desiredCount) {
@@ -458,7 +481,7 @@ async function pickDistinctGroqConsensusModels(
       }
     }
     for (const other of chatCapable) {
-      if (!picked.includes(other)) {
+      if (!picked.includes(other) && !other.includes('8b-instant')) {
         picked.push(other);
         if (picked.length >= desiredCount) {
           return picked;
@@ -471,7 +494,7 @@ async function pickDistinctGroqConsensusModels(
   }
 
   void fetchGroqAvailableModelIds(apiKey, true);
-  for (const candidate of MODELS.GROQ_CONSENSUS_CANDIDATES) {
+  for (const candidate of candidatePool) {
     if (!picked.includes(candidate)) {
       picked.push(candidate);
       if (picked.length >= desiredCount) {
@@ -484,15 +507,25 @@ async function pickDistinctGroqConsensusModels(
 
 function computeGroqModelWeight(modelId: string): number {
   const lower = modelId.toLowerCase();
-  if (
-    lower.includes('maverick') ||
-    lower.includes('120b') ||
-    lower.includes('70b') ||
-    lower.includes('qwen3.8')
-  ) {
-    return 1.32;
+  if (lower.includes('120b')) {
+    return 1.58;
   }
-  return 1.08;
+  if (lower.includes('qwen3.8') || lower.includes('qwen3')) {
+    return 1.48;
+  }
+  if (lower.includes('70b')) {
+    return 1.44;
+  }
+  if (lower.includes('maverick')) {
+    return 1.38;
+  }
+  if (lower.includes('20b')) {
+    return 1.22;
+  }
+  if (lower.includes('8b')) {
+    return 0.78;
+  }
+  return 1.06;
 }
 
 export async function selectGroqVisionModel(
@@ -569,12 +602,41 @@ export async function selectGroqVisionModel(
 export function buildQuizSystemInstruction(
   multiSelect: boolean,
   optionCount: number,
-  pinnedContext: string
+  pinnedContext: string,
+  deepAccuracy = false
 ): string {
   const maxIndex = Math.max(1, optionCount) - 1;
-  const baseDirective = multiSelect
-    ? `You are an expert deterministic quiz solver. Carefully check negations (NOT/EXCEPT), exact terminology, and sequence order. Identify ALL correct options and output ONLY their zero-based integer indices (between 0 and ${maxIndex}) separated by commas with no spaces or prose, for example: 0,2`
-    : `You are an expert deterministic quiz solver. Carefully check negations (NOT/EXCEPT), exact terminology, and sequence order. Identify the single best option and output ONLY its zero-based integer index (an integer from 0 to ${maxIndex}). Output strictly the digit with zero words, punctuation, or explanation.`;
+  let baseDirective: string;
+
+  if (deepAccuracy) {
+    baseDirective = multiSelect
+      ? [
+          'You are a rigorous university professor and deterministic exam solver.',
+          'Carefully analyze every word of the question and each option [0] (Option A) through [' +
+            maxIndex +
+            '].',
+          'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options (such as "Both A and B" / "Cả A và B đều đúng" / "All of the above").',
+          'First write a concise 2 to 4 sentence verification evaluating the statements and computing any formula step-by-step.',
+          'Then on the VERY LAST LINE output the exact tag <<ANSWER: i,j>> containing ONLY the zero-based integer indices (0 to ' +
+            maxIndex +
+            ') of ALL correct options separated by commas (for example: <<ANSWER: 0,2>>). Never put option letters inside <<ANSWER: ...>>, only zero-based integers.',
+        ].join(' ')
+      : [
+          'You are a rigorous university professor and deterministic exam solver.',
+          'Carefully analyze every word of the question and each option [0] (Option A) through [' +
+            maxIndex +
+            '].',
+          'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options (such as "Both A and B" / "Cả A và B đều đúng" / "All of the above" / "None of the above").',
+          'First write a concise 2 to 4 sentence verification evaluating each candidate option and computing any formula step-by-step.',
+          'Then on the VERY LAST LINE output the exact tag <<ANSWER: k>> where k is the single best zero-based integer index from 0 to ' +
+            maxIndex +
+            ' (for example: <<ANSWER: 2>>). Never put option letters inside <<ANSWER: ...>>, only the zero-based integer.',
+        ].join(' ');
+  } else {
+    baseDirective = multiSelect
+      ? `You are an expert deterministic quiz solver. Carefully check negations (NOT/EXCEPT), exact terminology, and sequence order. Identify ALL correct options and output ONLY their zero-based integer indices (between 0 and ${maxIndex}) separated by commas with no spaces or prose, for example: 0,2`
+      : `You are an expert deterministic quiz solver. Carefully check negations (NOT/EXCEPT), exact terminology, and sequence order. Identify the single best option and output ONLY its zero-based integer index (an integer from 0 to ${maxIndex}). Output strictly the digit with zero words, punctuation, or explanation.`;
+  }
 
   const trimmedContext = pinnedContext.trim();
   if (!trimmedContext) {
@@ -586,9 +648,12 @@ export function buildQuizSystemInstruction(
 
 function buildQuizUserPrompt(payload: QuestionPayload): string {
   const formattedChoices = payload.options
-    .map((optionText, idx) => `[${idx}] ${optionText}`)
+    .map((optionText, idx) => {
+      const letter = String.fromCharCode(65 + idx);
+      return `[${idx}] (Option ${letter}): ${optionText}`;
+    })
     .join('\n');
-  return `Question: ${payload.questionText}\nOptions:\n${formattedChoices}`;
+  return `Question:\n${payload.questionText}\n\nOptions:\n${formattedChoices}`;
 }
 
 export function extractGeminiInteractionText(
@@ -631,19 +696,29 @@ export async function runGroqTextCompletionWithFallback(
   apiKey: string,
   signal: AbortSignal,
   preferredModel?: string,
-  initialExclusions: Iterable<string> = []
+  initialExclusions: Iterable<string> = [],
+  deepAccuracy = false
 ): Promise<number[]> {
   const excluded = new Set<string>(initialExclusions);
+  if (deepAccuracy) {
+    excluded.add('llama-3.1-8b-instant');
+  }
   let lastError = 'Groq inference failed';
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     const modelId = await selectGroqTextModel(
       apiKey,
       excluded,
       attempt > 0,
       attempt === 0 ? preferredModel : undefined
     );
-    const maxTokens = isReasoningModel(modelId) ? 240 : 6;
+    const maxTokens = deepAccuracy
+      ? isReasoningModel(modelId)
+        ? 1100
+        : 520
+      : isReasoningModel(modelId)
+        ? 420
+        : 8;
 
     const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
       method: 'POST',
@@ -685,6 +760,9 @@ export async function runGroqTextCompletionWithFallback(
         response.status === 429
       ) {
         excluded.add(modelId);
+        if (response.status === 429 && deepAccuracy) {
+          await sleepAbortable(750, signal);
+        }
         continue;
       }
       throw new Error(lastError);
@@ -714,7 +792,8 @@ export async function runOpenRouterTextCompletionWithFallback(
   optionCount: number,
   multiSelect: boolean,
   apiKey: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  deepAccuracy = false
 ): Promise<number[]> {
   const keyHash = computeFnv1aHash(apiKey);
   const candidates: string[] = [];
@@ -734,7 +813,13 @@ export async function runOpenRouterTextCompletionWithFallback(
 
   for (let attempt = 0; attempt < Math.min(3, candidates.length); attempt += 1) {
     const modelId = candidates[attempt];
-    const maxTokens = isReasoningModel(modelId) || modelId === 'openrouter/auto' ? 240 : 10;
+    const maxTokens = deepAccuracy
+      ? isReasoningModel(modelId) || modelId === 'openrouter/auto'
+        ? 1100
+        : 520
+      : isReasoningModel(modelId) || modelId === 'openrouter/auto'
+        ? 420
+        : 12;
 
     const response = await fetch(API_ENDPOINTS.OPENROUTER_CHAT_COMPLETIONS, {
       method: 'POST',
@@ -811,8 +896,23 @@ export async function runGeminiTextCompletion(
   optionCount: number,
   multiSelect: boolean,
   apiKey: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  deepAccuracy = false,
+  imageBase64?: string,
+  imageMimeType?: string
 ): Promise<number[]> {
+  const inputPayload =
+    imageBase64 && imageBase64.length > 0
+      ? [
+          { type: 'text', text: userPrompt },
+          {
+            type: 'image',
+            data: imageBase64,
+            mime_type: imageMimeType ?? 'image/webp',
+          },
+        ]
+      : userPrompt;
+
   const response = await fetch(API_ENDPOINTS.GEMINI_INTERACTIONS, {
     method: 'POST',
     signal,
@@ -825,9 +925,9 @@ export async function runGeminiTextCompletion(
       model: MODELS.GEMINI_PRIMARY,
       store: false,
       system_instruction: systemInstruction,
-      input: userPrompt,
+      input: inputPayload,
       generation_config: {
-        thinking_level: 'low',
+        thinking_level: deepAccuracy ? 'high' : 'low',
         seed: 0,
       },
     }),
@@ -877,7 +977,7 @@ export async function runGroqVisionCompletionWithFallback(
     if (!modelId) {
       break;
     }
-    const maxTokens = isReasoningModel(modelId) ? 240 : 12;
+    const maxTokens = isReasoningModel(modelId) ? 640 : 380;
     const dataImageUri = 'data:' + mimeType + ';base64,' + base64;
 
     const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
@@ -931,6 +1031,9 @@ export async function runGroqVisionCompletionWithFallback(
         response.status === 429
       ) {
         excluded.add(modelId);
+        if (response.status === 429) {
+          await sleepAbortable(650, signal);
+        }
         continue;
       }
       throw new Error(lastError);
@@ -945,7 +1048,7 @@ export async function runGroqVisionCompletionWithFallback(
       .trim()
       .toUpperCase();
 
-    if (cleanedUpper.includes('NONE')) {
+    if (cleanedUpper === 'NONE') {
       void recordVerifiedGroqModel(apiKey, 'vision', modelId);
       return { indices: [], hostOnlyBlank: true };
     }
@@ -1015,14 +1118,18 @@ function buildVoteKey(indices: number[], multiSelect: boolean): string {
 
 async function executeFastestFirstRace(
   voters: ConsensusVoterSpec[],
-  startedAt: number
+  startedAt: number,
+  deepAccuracy = false
 ): Promise<RaceResult> {
   const controllers = voters.map(() => new AbortController());
+  const timeoutMs = deepAccuracy
+    ? DEEP_INFERENCE_TIMEOUT_MS
+    : INFERENCE_TIMEOUT_MS;
   const timeoutHandle = setTimeout(() => {
     for (const ctrl of controllers) {
       ctrl.abort();
     }
-  }, INFERENCE_TIMEOUT_MS);
+  }, timeoutMs);
 
   try {
     const tasks = voters.map(async (voter, idx): Promise<RaceResult> => {
@@ -1045,18 +1152,25 @@ async function executeFastestFirstRace(
 async function executeWeightedConsensusRace(
   voters: ConsensusVoterSpec[],
   multiSelect: boolean,
-  startedAt: number
+  startedAt: number,
+  deepAccuracy = false
 ): Promise<RaceResult> {
   if (voters.length === 1) {
-    return executeFastestFirstRace(voters, startedAt);
+    return executeFastestFirstRace(voters, startedAt, deepAccuracy);
   }
 
   const controllers = voters.map(() => new AbortController());
+  const timeoutMs = deepAccuracy
+    ? DEEP_INFERENCE_TIMEOUT_MS
+    : INFERENCE_TIMEOUT_MS;
+  const windowMs = deepAccuracy
+    ? DEEP_CONSENSUS_WINDOW_MS
+    : CONSENSUS_DECISION_WINDOW_MS;
   const hardTimeoutHandle = setTimeout(() => {
     for (const ctrl of controllers) {
       ctrl.abort();
     }
-  }, INFERENCE_TIMEOUT_MS);
+  }, timeoutMs);
 
   try {
     return await new Promise<RaceResult>((resolve, reject) => {
@@ -1133,8 +1247,18 @@ async function executeWeightedConsensusRace(
             const ranked = getRankedBuckets();
             const top = ranked[0];
             const runnerUpCount = ranked[1]?.count ?? 0;
+            const remainingVoters = Math.max(0, voters.length - settledCount);
 
-            if (top && top.count >= 2 && top.count > runnerUpCount) {
+            if (deepAccuracy) {
+              if (
+                top &&
+                top.count >= 2 &&
+                top.count > runnerUpCount + remainingVoters
+              ) {
+                finalizeBestBucket();
+                return;
+              }
+            } else if (top && top.count >= 2 && top.count > runnerUpCount) {
               finalizeBestBucket();
               return;
             }
@@ -1148,7 +1272,7 @@ async function executeWeightedConsensusRace(
               decisionWindowTimer = setTimeout(() => {
                 decisionWindowTimer = null;
                 finalizeBestBucket();
-              }, CONSENSUS_DECISION_WINDOW_MS);
+              }, windowMs);
             }
           } catch (err) {
             if (finished) {
@@ -1190,7 +1314,10 @@ export async function raceCustomPromptInference(
   optionCount: number,
   multiSelect: boolean,
   settings: EngineSettings,
-  startedAt = performance.now()
+  startedAt = performance.now(),
+  deepAccuracy = false,
+  imageBase64?: string,
+  imageMimeType?: string
 ): Promise<RaceResult> {
   const configuredProviders: Array<{
     provider: AiProviderId;
@@ -1241,19 +1368,20 @@ export async function raceCustomPromptInference(
     ? configuredProviders.filter((entry) => !entry.mutedMsg)
     : configuredProviders;
 
-  const useConsensus = settings.consensusMode !== 'fastest_first';
+  const useConsensus = deepAccuracy || settings.consensusMode !== 'fastest_first';
   const voters: ConsensusVoterSpec[] = [];
 
   const nonGroqCount = runnableProviders.filter(
     (entry) => entry.provider !== 'groq'
   ).length;
+  const hasEmbeddedImage = Boolean(imageBase64 && imageBase64.length > 0);
 
   for (const entry of runnableProviders) {
     if (entry.provider === 'gemini') {
       voters.push({
         id: 'gemini-primary',
         tier: 'tier3_gemini',
-        weight: 1.42,
+        weight: deepAccuracy ? 1.75 : 1.42,
         run: (signal) =>
           runGeminiTextCompletion(
             systemInstruction,
@@ -1261,25 +1389,55 @@ export async function raceCustomPromptInference(
             optionCount,
             multiSelect,
             entry.apiKey,
-            signal
+            signal,
+            deepAccuracy,
+            imageBase64,
+            imageMimeType
           ),
       });
     } else if (entry.provider === 'openrouter') {
-      voters.push({
-        id: 'openrouter-primary',
-        tier: 'tier3_openrouter',
-        weight: 1.28,
-        run: (signal) =>
-          runOpenRouterTextCompletionWithFallback(
-            systemInstruction,
-            userPrompt,
-            optionCount,
-            multiSelect,
-            entry.apiKey,
-            signal
-          ),
-      });
+      if (!hasEmbeddedImage) {
+        voters.push({
+          id: 'openrouter-primary',
+          tier: 'tier3_openrouter',
+          weight: deepAccuracy ? 1.45 : 1.28,
+          run: (signal) =>
+            runOpenRouterTextCompletionWithFallback(
+              systemInstruction,
+              userPrompt,
+              optionCount,
+              multiSelect,
+              entry.apiKey,
+              signal,
+              deepAccuracy
+            ),
+        });
+      }
     } else if (entry.provider === 'groq') {
+      if (hasEmbeddedImage) {
+        voters.push({
+          id: 'groq-vision-embedded',
+          tier: 'tier3_groq',
+          weight: 1.38,
+          run: async (signal) => {
+            const vRes = await runGroqVisionCompletionWithFallback(
+              systemInstruction,
+              userPrompt,
+              imageBase64!,
+              imageMimeType ?? 'image/webp',
+              optionCount,
+              multiSelect,
+              entry.apiKey,
+              signal
+            );
+            if (vRes.indices.length === 0) {
+              throw new Error('Groq multimodal returned no valid index');
+            }
+            return vRes.indices;
+          },
+        });
+      }
+
       if (!useConsensus) {
         voters.push({
           id: 'groq-fast',
@@ -1292,14 +1450,26 @@ export async function raceCustomPromptInference(
               optionCount,
               multiSelect,
               entry.apiKey,
-              signal
+              signal,
+              undefined,
+              [],
+              deepAccuracy
             ),
         });
       } else {
-        const desiredGroqVoters = nonGroqCount >= 2 ? 1 : 2;
+        const desiredGroqVoters = deepAccuracy
+          ? nonGroqCount >= 2
+            ? 2
+            : nonGroqCount === 1
+              ? 2
+              : 3
+          : nonGroqCount >= 2
+            ? 1
+            : 2;
         const groqModels = await pickDistinctGroqConsensusModels(
           entry.apiKey,
-          desiredGroqVoters
+          desiredGroqVoters,
+          deepAccuracy
         );
         groqModels.forEach((assignedModel, idx) => {
           const siblingModels = groqModels.filter((_, j) => j !== idx);
@@ -1316,7 +1486,8 @@ export async function raceCustomPromptInference(
                 entry.apiKey,
                 signal,
                 assignedModel,
-                siblingModels
+                siblingModels,
+                deepAccuracy
               ),
           });
         });
@@ -1326,9 +1497,14 @@ export async function raceCustomPromptInference(
 
   try {
     if (useConsensus) {
-      return await executeWeightedConsensusRace(voters, multiSelect, startedAt);
+      return await executeWeightedConsensusRace(
+        voters,
+        multiSelect,
+        startedAt,
+        deepAccuracy
+      );
     }
-    return await executeFastestFirstRace(voters, startedAt);
+    return await executeFastestFirstRace(voters, startedAt, deepAccuracy);
   } catch (err) {
     const localFallback = await tryChromeBuiltInLocalAi(
       systemInstruction,
@@ -1353,13 +1529,16 @@ export async function raceCustomPromptInference(
 
 export function buildFillBlankSystemInstruction(
   blankLengthHint: number | undefined,
-  pinnedContext: string
+  pinnedContext: string,
+  deepAccuracy = false
 ): string {
   const lengthRule =
     typeof blankLengthHint === 'number' && blankLengthHint > 0
       ? ` CRITICAL: The input box has exactly ${blankLengthHint} character slots, so your answer MUST be ${blankLengthHint} characters (excluding spaces if needed to fit ${blankLengthHint}).`
       : '';
-  const baseDirective = `You are an expert deterministic quiz solver for Fill-in-the-Blank and Short-Answer questions. Output ONLY the exact missing word, number, symbol, or concise phrase that answers the question.${lengthRule} Output zero explanation, zero surrounding quotes, zero markdown, and zero trailing period.`;
+  const baseDirective = deepAccuracy
+    ? `You are a rigorous university professor solving a Fill-in-the-Blank / Numerical / Short-Answer exam question.${lengthRule} First verify any formula, unit conversion, or rounding requirement concisely in 2 to 3 sentences. Then on the VERY LAST LINE output <<ANSWER: exact_value>> containing ONLY the exact number, word, or concise phrase (with no surrounding quotes or units unless requested).`
+    : `You are an expert deterministic quiz solver for Fill-in-the-Blank and Short-Answer questions. Output ONLY the exact missing word, number, symbol, or concise phrase that answers the question.${lengthRule} Output zero explanation, zero surrounding quotes, zero markdown, and zero trailing period.`;
 
   const trimmedContext = pinnedContext.trim();
   if (!trimmedContext) {
@@ -1375,9 +1554,13 @@ async function runGroqFillBlankWithFallback(
   apiKey: string,
   signal: AbortSignal,
   preferredModel?: string,
-  initialExclusions: Iterable<string> = []
+  initialExclusions: Iterable<string> = [],
+  deepAccuracy = false
 ): Promise<string> {
   const excluded = new Set<string>(initialExclusions);
+  if (deepAccuracy) {
+    excluded.add('llama-3.1-8b-instant');
+  }
   let lastError = 'Groq fill-blank inference failed';
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1387,7 +1570,13 @@ async function runGroqFillBlankWithFallback(
       attempt > 0,
       attempt === 0 ? preferredModel : undefined
     );
-    const maxTokens = isReasoningModel(modelId) ? 280 : 40;
+    const maxTokens = deepAccuracy
+      ? isReasoningModel(modelId)
+        ? 1100
+        : 480
+      : isReasoningModel(modelId)
+        ? 420
+        : 40;
 
     const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
       method: 'POST',
@@ -1427,6 +1616,9 @@ async function runGroqFillBlankWithFallback(
         response.status === 429
       ) {
         excluded.add(modelId);
+        if (response.status === 429 && deepAccuracy) {
+          await sleepAbortable(750, signal);
+        }
         continue;
       }
       throw new Error(lastError);
@@ -1453,7 +1645,8 @@ async function runOpenRouterFillBlankWithFallback(
   userPrompt: string,
   expectedLength: number | undefined,
   apiKey: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  deepAccuracy = false
 ): Promise<string> {
   const keyHash = computeFnv1aHash(apiKey);
   const candidates: string[] = [];
@@ -1473,8 +1666,13 @@ async function runOpenRouterFillBlankWithFallback(
 
   for (let attempt = 0; attempt < Math.min(3, candidates.length); attempt += 1) {
     const modelId = candidates[attempt];
-    const maxTokens =
-      isReasoningModel(modelId) || modelId === 'openrouter/auto' ? 280 : 48;
+    const maxTokens = deepAccuracy
+      ? isReasoningModel(modelId) || modelId === 'openrouter/auto'
+        ? 1100
+        : 480
+      : isReasoningModel(modelId) || modelId === 'openrouter/auto'
+        ? 420
+        : 48;
 
     const response = await fetch(API_ENDPOINTS.OPENROUTER_CHAT_COMPLETIONS, {
       method: 'POST',
@@ -1546,8 +1744,23 @@ async function runGeminiFillBlankCompletion(
   userPrompt: string,
   expectedLength: number | undefined,
   apiKey: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  deepAccuracy = false,
+  imageBase64?: string,
+  imageMimeType?: string
 ): Promise<string> {
+  const inputPayload =
+    imageBase64 && imageBase64.length > 0
+      ? [
+          { type: 'text', text: userPrompt },
+          {
+            type: 'image',
+            data: imageBase64,
+            mime_type: imageMimeType ?? 'image/webp',
+          },
+        ]
+      : userPrompt;
+
   const response = await fetch(API_ENDPOINTS.GEMINI_INTERACTIONS, {
     method: 'POST',
     signal,
@@ -1560,9 +1773,9 @@ async function runGeminiFillBlankCompletion(
       model: MODELS.GEMINI_PRIMARY,
       store: false,
       system_instruction: systemInstruction,
-      input: userPrompt,
+      input: inputPayload,
       generation_config: {
-        thinking_level: 'low',
+        thinking_level: deepAccuracy ? 'high' : 'low',
         seed: 0,
       },
     }),
@@ -1609,7 +1822,7 @@ export async function runGroqVisionFillBlankWithFallback(
     if (!modelId) {
       break;
     }
-    const maxTokens = isReasoningModel(modelId) ? 280 : 48;
+    const maxTokens = isReasoningModel(modelId) ? 640 : 320;
     const dataImageUri = 'data:' + mimeType + ';base64,' + base64;
 
     const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
@@ -1659,6 +1872,9 @@ export async function runGroqVisionFillBlankWithFallback(
         response.status === 429
       ) {
         excluded.add(modelId);
+        if (response.status === 429) {
+          await sleepAbortable(650, signal);
+        }
         continue;
       }
       throw new Error(lastError);
@@ -1695,7 +1911,10 @@ export async function raceCustomFillBlankInference(
   userPrompt: string,
   expectedLength: number | undefined,
   settings: EngineSettings,
-  startedAt = performance.now()
+  startedAt = performance.now(),
+  deepAccuracy = false,
+  imageBase64?: string,
+  imageMimeType?: string
 ): Promise<RaceResult> {
   const configuredProviders: Array<{
     provider: AiProviderId;
@@ -1773,10 +1992,11 @@ export async function raceCustomFillBlankInference(
   const runnableProviders = anyUnmuted
     ? configuredProviders.filter((entry) => !entry.mutedMsg)
     : configuredProviders;
-  const useConsensus = settings.consensusMode !== 'fastest_first';
+  const useConsensus = deepAccuracy || settings.consensusMode !== 'fastest_first';
   const nonGroqCount = runnableProviders.filter(
     (entry) => entry.provider !== 'groq'
   ).length;
+  const hasEmbeddedImage = Boolean(imageBase64 && imageBase64.length > 0);
 
   interface TextVoterSpec {
     tier: RaceResult['tier'];
@@ -1790,30 +2010,58 @@ export async function raceCustomFillBlankInference(
     if (entry.provider === 'gemini') {
       textVoters.push({
         tier: 'tier3_gemini',
-        weight: 1.42,
+        weight: deepAccuracy ? 1.75 : 1.42,
         run: (signal) =>
           runGeminiFillBlankCompletion(
             systemInstruction,
             userPrompt,
             expectedLength,
             entry.apiKey,
-            signal
+            signal,
+            deepAccuracy,
+            imageBase64,
+            imageMimeType
           ),
       });
     } else if (entry.provider === 'openrouter') {
-      textVoters.push({
-        tier: 'tier3_openrouter',
-        weight: 1.28,
-        run: (signal) =>
-          runOpenRouterFillBlankWithFallback(
-            systemInstruction,
-            userPrompt,
-            expectedLength,
-            entry.apiKey,
-            signal
-          ),
-      });
+      if (!hasEmbeddedImage) {
+        textVoters.push({
+          tier: 'tier3_openrouter',
+          weight: deepAccuracy ? 1.45 : 1.28,
+          run: (signal) =>
+            runOpenRouterFillBlankWithFallback(
+              systemInstruction,
+              userPrompt,
+              expectedLength,
+              entry.apiKey,
+              signal,
+              deepAccuracy
+            ),
+        });
+      }
     } else if (entry.provider === 'groq') {
+      if (hasEmbeddedImage) {
+        textVoters.push({
+          tier: 'tier3_groq',
+          weight: 1.38,
+          run: async (signal) => {
+            const vRes = await runGroqVisionFillBlankWithFallback(
+              systemInstruction,
+              userPrompt,
+              imageBase64!,
+              imageMimeType ?? 'image/webp',
+              expectedLength,
+              entry.apiKey,
+              signal
+            );
+            if (!vRes.fillText) {
+              throw new Error('Groq multimodal returned empty fill-blank');
+            }
+            return vRes.fillText;
+          },
+        });
+      }
+
       if (!useConsensus) {
         textVoters.push({
           tier: 'tier3_groq',
@@ -1824,14 +2072,26 @@ export async function raceCustomFillBlankInference(
               userPrompt,
               expectedLength,
               entry.apiKey,
-              signal
+              signal,
+              undefined,
+              [],
+              deepAccuracy
             ),
         });
       } else {
-        const desiredGroq = nonGroqCount >= 2 ? 1 : 2;
+        const desiredGroq = deepAccuracy
+          ? nonGroqCount >= 2
+            ? 2
+            : nonGroqCount === 1
+              ? 2
+              : 3
+          : nonGroqCount >= 2
+            ? 1
+            : 2;
         const groqModels = await pickDistinctGroqConsensusModels(
           entry.apiKey,
-          desiredGroq
+          desiredGroq,
+          deepAccuracy
         );
         groqModels.forEach((assignedModel, idx) => {
           const siblings = groqModels.filter((_, j) => j !== idx);
@@ -1846,7 +2106,8 @@ export async function raceCustomFillBlankInference(
                 entry.apiKey,
                 signal,
                 assignedModel,
-                siblings
+                siblings,
+                deepAccuracy
               ),
           });
         });
@@ -1855,11 +2116,17 @@ export async function raceCustomFillBlankInference(
   }
 
   const controllers = textVoters.map(() => new AbortController());
+  const timeoutMs = deepAccuracy
+    ? DEEP_INFERENCE_TIMEOUT_MS
+    : INFERENCE_TIMEOUT_MS;
+  const windowMs = deepAccuracy
+    ? DEEP_CONSENSUS_WINDOW_MS
+    : CONSENSUS_DECISION_WINDOW_MS;
   const hardTimeoutHandle = setTimeout(() => {
     for (const ctrl of controllers) {
       ctrl.abort();
     }
-  }, INFERENCE_TIMEOUT_MS);
+  }, timeoutMs);
 
   try {
     if (!useConsensus || textVoters.length === 1) {
@@ -1957,7 +2224,13 @@ export async function raceCustomFillBlankInference(
             const ranked = rank();
             const top = ranked[0];
             const runnerUp = ranked[1]?.count ?? 0;
-            if (top && top.count >= 2 && top.count > runnerUp) {
+            const remaining = Math.max(0, textVoters.length - settledCount);
+            if (deepAccuracy) {
+              if (top && top.count >= 2 && top.count > runnerUp + remaining) {
+                finalize();
+                return;
+              }
+            } else if (top && top.count >= 2 && top.count > runnerUp) {
               finalize();
               return;
             }
@@ -1969,7 +2242,7 @@ export async function raceCustomFillBlankInference(
               windowTimer = setTimeout(() => {
                 windowTimer = null;
                 finalize();
-              }, CONSENSUS_DECISION_WINDOW_MS);
+              }, windowMs);
             }
           } catch (err) {
             if (finished) {
@@ -2017,18 +2290,25 @@ export async function raceParallelInference(
   settings: EngineSettings
 ): Promise<RaceResult> {
   const startedAt = performance.now();
+  const deepAccuracy =
+    Boolean(payload.deepAccuracy) || payload.platform === 'universal';
+
   if (payload.questionKind === 'fill_blank') {
     const systemInstruction = buildFillBlankSystemInstruction(
       payload.blankLengthHint,
-      settings.pinnedContext
+      settings.pinnedContext,
+      deepAccuracy
     );
-    const userPrompt = `Question: ${payload.questionText}`;
+    const userPrompt = `Question:\n${payload.questionText}`;
     return raceCustomFillBlankInference(
       systemInstruction,
       userPrompt,
       payload.blankLengthHint,
       settings,
-      startedAt
+      startedAt,
+      deepAccuracy,
+      payload.imageBase64,
+      payload.imageMimeType
     );
   }
 
@@ -2039,7 +2319,8 @@ export async function raceParallelInference(
   const systemInstruction = buildQuizSystemInstruction(
     payload.multiSelect,
     optionCount,
-    settings.pinnedContext
+    settings.pinnedContext,
+    deepAccuracy
   );
   const userPrompt = buildQuizUserPrompt(payload);
 
@@ -2049,7 +2330,10 @@ export async function raceParallelInference(
     optionCount,
     payload.multiSelect,
     settings,
-    startedAt
+    startedAt,
+    deepAccuracy,
+    payload.imageBase64,
+    payload.imageMimeType
   );
 }
 
