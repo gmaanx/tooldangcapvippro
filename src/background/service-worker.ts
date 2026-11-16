@@ -25,6 +25,7 @@ import type {
   RuntimeClickResponse,
   RuntimeRequestMessage,
   RuntimeResolveResponse,
+  RuntimeScanResponse,
   RuntimeStatusResponse,
 } from '../shared/types';
 import { raceParallelInference, warmupProviderConnections } from './ai-racer';
@@ -133,12 +134,14 @@ async function openOrNavigateLivePinJoinTab(pin: string): Promise<boolean> {
 function attachTriggerSettings(
   resolution: AnswerResolution,
   settings: EngineSettings,
-  multiSelect: boolean
+  multiSelect: boolean,
+  forceHighlightOnly = false
 ): AnswerResolution {
   return {
     ...resolution,
     multiSelect,
-    triggerMode: settings.triggerMode,
+    triggerMode: forceHighlightOnly ? 'highlight_only' : settings.triggerMode,
+    highlightStyle: settings.highlightStyle,
     targetScore: settings.targetScore,
     minDelayMs: settings.minDelayMs,
     maxDelayMs: settings.maxDelayMs,
@@ -184,13 +187,20 @@ function isKahootPlayableUrl(url: string | undefined): boolean {
   }
 }
 
+function isHttpWebUrl(url: string | undefined): boolean {
+  if (!url) {
+    return false;
+  }
+  return url.startsWith('https://') || url.startsWith('http://');
+}
+
 async function findTargetKahootTab(
   preferredTab?: chrome.tabs.Tab
 ): Promise<chrome.tabs.Tab | undefined> {
   if (
     preferredTab &&
     typeof preferredTab.id === 'number' &&
-    isKahootPlayableUrl(preferredTab.url)
+    isHttpWebUrl(preferredTab.url)
   ) {
     return preferredTab;
   }
@@ -202,7 +212,7 @@ async function findTargetKahootTab(
   if (
     focusedTab &&
     typeof focusedTab.id === 'number' &&
-    isKahootPlayableUrl(focusedTab.url)
+    isHttpWebUrl(focusedTab.url)
   ) {
     return focusedTab;
   }
@@ -218,6 +228,108 @@ async function findTargetKahootTab(
   }
 
   return quizTabs.find((item) => typeof item.id === 'number') ?? focusedTab;
+}
+
+async function triggerUniversalScanOnTab(
+  preferredTabId?: number
+): Promise<RuntimeScanResponse> {
+  try {
+    const settings = await getFastSettings();
+    if (!settings.enabled) {
+      return {
+        ok: false,
+        detectedCount: 0,
+        solvedCount: 0,
+        error: 'Engine is currently paused. Enable Active toggle first.',
+      };
+    }
+
+    let targetTab: chrome.tabs.Tab | undefined;
+    if (typeof preferredTabId === 'number') {
+      try {
+        targetTab = await chrome.tabs.get(preferredTabId);
+      } catch {
+        targetTab = undefined;
+      }
+    }
+    if (!targetTab) {
+      targetTab = await findTargetKahootTab(undefined);
+    }
+
+    if (
+      !targetTab ||
+      typeof targetTab.id !== 'number' ||
+      !isHttpWebUrl(targetTab.url)
+    ) {
+      return {
+        ok: false,
+        detectedCount: 0,
+        solvedCount: 0,
+        error: 'Open an HTTP/HTTPS quiz or LMS tab before scanning.',
+      };
+    }
+
+    if (isKahootPlayableUrl(targetTab.url)) {
+      await ensureContentScriptsOnOpenKahootTabs();
+      return {
+        ok: true,
+        detectedCount: 1,
+        solvedCount: 1,
+      };
+    }
+
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: targetTab.id, allFrames: true },
+        files: ['content/universal-lms.js'],
+        world: 'ISOLATED',
+      });
+    } catch {
+      void 0;
+    }
+
+    const frameResults = await chrome.scripting.executeScript({
+      target: { tabId: targetTab.id, allFrames: true },
+      world: 'ISOLATED',
+      func: async () => {
+        const win = window as Window & {
+          __kheUniversalTriggerScan?: (
+            force: boolean
+          ) => Promise<{ detectedCount: number; solvedCount: number }>;
+        };
+        if (typeof win.__kheUniversalTriggerScan === 'function') {
+          return await win.__kheUniversalTriggerScan(true);
+        }
+        return { detectedCount: 0, solvedCount: 0 };
+      },
+    });
+
+    let detectedCount = 0;
+    let solvedCount = 0;
+    for (const frame of frameResults) {
+      if (frame?.result) {
+        detectedCount += frame.result.detectedCount ?? 0;
+        solvedCount += frame.result.solvedCount ?? 0;
+      }
+    }
+
+    if (detectedCount > 0) {
+      void setBadgeFeedback(String(solvedCount), '#0D9488');
+    }
+
+    return {
+      ok: true,
+      detectedCount,
+      solvedCount,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      detectedCount: 0,
+      solvedCount: 0,
+      error: err instanceof Error ? err.message : 'Page scan failed.',
+    };
+  }
 }
 
 async function ensureContentScriptsOnOpenKahootTabs(): Promise<void> {
@@ -313,7 +425,8 @@ async function broadcastResolutionToPlayerTabs(
 async function handleQuestionResolution(
   payload: QuestionPayload,
   senderTabId: number | undefined,
-  senderWindowId: number | undefined
+  senderWindowId: number | undefined,
+  senderTabUrl?: string
 ): Promise<RuntimeResolveResponse> {
   const settings = await getFastSettings();
   if (!settings.enabled) {
@@ -323,9 +436,18 @@ async function handleQuestionResolution(
     };
   }
 
+  const isExternalHighlightOnly =
+    payload.platform === 'universal' || !isKahootPlayableUrl(senderTabUrl);
+
   const finalizeResolution = (base: AnswerResolution): RuntimeResolveResponse => {
-    const enriched = attachTriggerSettings(base, settings, payload.multiSelect);
+    const enriched = attachTriggerSettings(
+      base,
+      settings,
+      payload.multiSelect,
+      isExternalHighlightOnly
+    );
     if (
+      !isExternalHighlightOnly &&
       settings.triggerMode === 'instant_auto_click' &&
       typeof senderTabId === 'number'
     ) {
@@ -375,7 +497,8 @@ async function handleQuestionResolution(
     }
 
     const canRunVision =
-      settings.groqApiKey.length > 0 || settings.geminiApiKey.length > 0;
+      !isExternalHighlightOnly &&
+      (settings.groqApiKey.length > 0 || settings.geminiApiKey.length > 0);
 
     if (payload.hasQuestionImage && canRunVision) {
       try {
@@ -473,6 +596,13 @@ async function handleQuestionResolution(
         void updateTelemetry({ lastError: errorMsg });
         return { ok: false, error: errorMsg };
       }
+    }
+
+    if (isExternalHighlightOnly) {
+      return {
+        ok: false,
+        error: 'Unable to extract fill-in-the-blank text on external page.',
+      };
     }
 
     try {
@@ -695,6 +825,13 @@ async function handleQuestionResolution(
     }
   }
 
+  if (isExternalHighlightOnly) {
+    return {
+      ok: false,
+      error: 'Unable to read question text or choices on external page.',
+    };
+  }
+
   try {
     const visionResult = await resolveViaVisionCapture(
       senderWindowId,
@@ -753,7 +890,8 @@ async function handleExplicitVisionFallback(
   tabId: number | undefined,
   windowId: number | undefined,
   questionKind?: QuestionKind,
-  blankLengthHint?: number
+  blankLengthHint?: number,
+  tabUrl?: string
 ): Promise<RuntimeResolveResponse> {
   const settings = await getFastSettings();
   if (!settings.enabled) {
@@ -762,6 +900,17 @@ async function handleExplicitVisionFallback(
       error: 'KahootHybridEngine is currently paused.',
     };
   }
+
+  let resolvedTabUrl = tabUrl;
+  if (!resolvedTabUrl && typeof tabId === 'number') {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      resolvedTabUrl = t.url;
+    } catch {
+      resolvedTabUrl = undefined;
+    }
+  }
+  const isExternalHighlightOnly = !isKahootPlayableUrl(resolvedTabUrl);
 
   try {
     const visionResult = await resolveViaVisionCapture(
@@ -796,10 +945,12 @@ async function handleExplicitVisionFallback(
         timestamp: Date.now(),
       },
       settings,
-      multiSelect
+      multiSelect,
+      isExternalHighlightOnly
     );
 
     if (
+      !isExternalHighlightOnly &&
       settings.triggerMode === 'instant_auto_click' &&
       typeof tabId === 'number'
     ) {
@@ -841,7 +992,8 @@ async function handleClipboardVisionRequest(
   tabId: number | undefined,
   directPayload?: ClipboardExtractedPayload,
   questionKind?: QuestionKind,
-  blankLengthHint?: number
+  blankLengthHint?: number,
+  tabUrl?: string
 ): Promise<RuntimeResolveResponse> {
   const settings = await getFastSettings();
   if (!settings.enabled) {
@@ -850,6 +1002,17 @@ async function handleClipboardVisionRequest(
       error: 'KahootHybridEngine is currently paused.',
     };
   }
+
+  let resolvedTabUrl = tabUrl;
+  if (!resolvedTabUrl && typeof tabId === 'number') {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      resolvedTabUrl = t.url;
+    } catch {
+      resolvedTabUrl = undefined;
+    }
+  }
+  const isExternalHighlightOnly = !isKahootPlayableUrl(resolvedTabUrl);
 
   try {
     const clipboardResult = directPayload
@@ -884,10 +1047,12 @@ async function handleClipboardVisionRequest(
         timestamp: Date.now(),
       },
       settings,
-      multiSelect
+      multiSelect,
+      isExternalHighlightOnly
     );
 
     if (
+      !isExternalHighlightOnly &&
       settings.triggerMode === 'instant_auto_click' &&
       typeof tabId === 'number'
     ) {
@@ -999,6 +1164,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 });
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
+  if (command === 'scan-page-questions') {
+    await triggerUniversalScanOnTab(tab?.id);
+    return;
+  }
+
   if (command === 'trigger-vision-fallback') {
     const targetTab = await findTargetKahootTab(tab);
     if (!targetTab || typeof targetTab.id !== 'number') {
@@ -1017,7 +1187,10 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
       4,
       false,
       targetTab.id,
-      targetTab.windowId
+      targetTab.windowId,
+      undefined,
+      undefined,
+      targetTab.url
     );
 
     if (result.ok && result.resolution) {
@@ -1030,8 +1203,13 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   }
 
   if (command === 'trigger-clipboard-vision') {
+    const settings = await getFastSettings();
     const targetTab = await findTargetKahootTab(tab);
-    if (targetTab && typeof targetTab.id === 'number') {
+    if (
+      targetTab &&
+      typeof targetTab.id === 'number' &&
+      settings.highlightStyle !== 'stealth'
+    ) {
       await sendContentPushSafe(targetTab.id, {
         type: 'CLIPBOARD_STATUS_TOAST',
         message: '⚡ Solving from Clipboard...',
@@ -1049,7 +1227,11 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
       -1,
       4,
       false,
-      targetTab?.id
+      targetTab?.id,
+      undefined,
+      undefined,
+      undefined,
+      targetTab?.url
     );
 
     if (targetTab && typeof targetTab.id === 'number') {
@@ -1058,16 +1240,18 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
           type: 'APPLY_RESOLVED_ANSWER',
           resolution: result.resolution,
         });
-        const label =
-          result.resolution.questionKind === 'fill_blank' &&
-          result.resolution.fillText
-            ? `"${result.resolution.fillText}"`
-            : `[${result.resolution.indices.join(', ')}]`;
-        await sendContentPushSafe(targetTab.id, {
-          type: 'CLIPBOARD_STATUS_TOAST',
-          message: `⚡ Clipboard → ${label} (${result.resolution.latencyMs}ms)`,
-        });
-      } else {
+        if (settings.highlightStyle !== 'stealth') {
+          const label =
+            result.resolution.questionKind === 'fill_blank' &&
+            result.resolution.fillText
+              ? `"${result.resolution.fillText}"`
+              : `[${result.resolution.indices.join(', ')}]`;
+          await sendContentPushSafe(targetTab.id, {
+            type: 'CLIPBOARD_STATUS_TOAST',
+            message: `⚡ Clipboard → ${label} (${result.resolution.latencyMs}ms)`,
+          });
+        }
+      } else if (settings.highlightStyle !== 'stealth') {
         await sendContentPushSafe(targetTab.id, {
           type: 'CLIPBOARD_STATUS_TOAST',
           message: result.error ?? 'Clipboard Vision failed',
@@ -1088,6 +1272,7 @@ chrome.runtime.onMessage.addListener(
         | RuntimeCacheResponse
         | RuntimeStatusResponse
         | RuntimeClickResponse
+        | RuntimeScanResponse
         | { ok: boolean }
     ) => void
   ) => {
@@ -1103,7 +1288,8 @@ chrome.runtime.onMessage.addListener(
           const res = await handleQuestionResolution(
             runtimeMsg.payload,
             sender.tab?.id,
-            sender.tab?.windowId
+            sender.tab?.windowId,
+            sender.tab?.url
           );
           sendResponse(res);
           break;
@@ -1112,7 +1298,8 @@ chrome.runtime.onMessage.addListener(
           const res = await handleQuestionResolution(
             runtimeMsg.payload,
             undefined,
-            sender.tab?.windowId
+            sender.tab?.windowId,
+            'https://play.kahoot.it/'
           );
           if (res.ok && res.resolution) {
             latestHostBroadcastResolution = res.resolution;
@@ -1180,7 +1367,8 @@ chrome.runtime.onMessage.addListener(
             targetTab?.id,
             targetTab?.windowId,
             runtimeMsg.questionKind,
-            runtimeMsg.blankLengthHint
+            runtimeMsg.blankLengthHint,
+            targetTab?.url
           );
           sendResponse(res);
           break;
@@ -1196,7 +1384,8 @@ chrome.runtime.onMessage.addListener(
             targetTab?.id,
             undefined,
             runtimeMsg.questionKind,
-            runtimeMsg.blankLengthHint
+            runtimeMsg.blankLengthHint,
+            targetTab?.url
           );
           sendResponse(res);
           break;
@@ -1210,9 +1399,17 @@ chrome.runtime.onMessage.addListener(
             sender.tab?.id,
             runtimeMsg.clipboard,
             runtimeMsg.questionKind,
-            runtimeMsg.blankLengthHint
+            runtimeMsg.blankLengthHint,
+            sender.tab?.url
           );
           sendResponse(res);
+          break;
+        }
+        case 'TRIGGER_UNIVERSAL_SCAN': {
+          const scanRes = await triggerUniversalScanOnTab(
+            runtimeMsg.tabId ?? sender.tab?.id
+          );
+          sendResponse(scanRes);
           break;
         }
         case 'PREFETCH_QUIZ_CACHE': {

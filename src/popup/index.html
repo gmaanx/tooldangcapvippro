@@ -13,7 +13,7 @@
       <span class="bolt-badge" aria-hidden="true">⚡</span>
       <div>
         <h1>KahootHybridEngine</h1>
-        <p class="subtitle">Kahoot &amp; Wayground &middot; Multi-AI Consensus</p>
+        <p class="subtitle">Kahoot, Wayground &amp; LMS &middot; Multi-AI Consensus</p>
       </div>
     </div>
     <label class="master-toggle" for="engine-enabled">
@@ -40,8 +40,8 @@
 
     <form id="settings-form" action="#" method="post" novalidate>
       <fieldset class="panel">
-        <legend>1. Execution &amp; Point Pacing</legend>
-        <p class="live-ready-note">Keep Chrome's top debugging bar open on <code>kahoot.it</code> &amp; <code>wayground.com</code> so real hardware Auto-Click &amp; Auto-Type work.</p>
+        <legend>1. Kahoot &amp; Wayground Execution</legend>
+        <p class="live-ready-note">Auto-Click runs only on <code>kahoot.it</code> &amp; <code>wayground.com</code>. External LMS &amp; custom sites are locked to <strong>Highlight-Only</strong>.</p>
         <div class="radio-group">
           <label class="radio-option" for="mode-instant">
             <input type="radio" id="mode-instant" name="triggerMode" value="instant_auto_click" checked>
@@ -152,7 +152,37 @@
       </fieldset>
 
       <fieldset class="panel">
-        <legend>2. Multi-AI Ensemble &amp; API Keys</legend>
+        <legend>2. Universal LMS &amp; Highlight Style</legend>
+        <label class="checkbox-card" for="universal-highlight-enabled">
+          <input type="checkbox" id="universal-highlight-enabled" name="universalHighlightEnabled" class="visually-hidden-fallback" checked>
+          <span>
+            <strong>External Sites &amp; LMS Auto-Highlight</strong>
+            <small>Moodle/UEH LMS, Canvas, Google/MS Forms &amp; custom quizzes (Highlight-Only, no auto-click)</small>
+          </span>
+        </label>
+
+        <div class="style-radio-grid" role="radiogroup" aria-label="Highlight visual style">
+          <label class="radio-option compact-radio" for="style-gold">
+            <input type="radio" id="style-gold" name="highlightStyle" value="gold" checked>
+            <span>
+              <strong>Gold Outline</strong>
+              <small>Clear gold border &amp; badge</small>
+            </span>
+          </label>
+          <label class="radio-option compact-radio" for="style-stealth">
+            <input type="radio" id="style-stealth" name="highlightStyle" value="stealth">
+            <span>
+              <strong>Stealth Mode</strong>
+              <small>Faint dotted text, no toast</small>
+            </span>
+          </label>
+        </div>
+
+        <button type="button" id="scan-page-btn" class="secondary-btn scan-page-btn">Scan &amp; Highlight Current Page (Alt+Shift+S)</button>
+      </fieldset>
+
+      <fieldset class="panel">
+        <legend>3. Multi-AI Ensemble &amp; API Keys</legend>
         <label class="checkbox-card" for="consensus-mode">
           <input type="checkbox" id="consensus-mode" name="consensusMode" class="visually-hidden-fallback" checked>
           <span>

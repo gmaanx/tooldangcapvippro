@@ -8,7 +8,9 @@ export type ConsensusMode = 'consensus_vote' | 'fastest_first';
 
 export type AiProviderId = 'groq' | 'gemini' | 'openrouter';
 
-export type QuizPlatform = 'kahoot' | 'wayground';
+export type QuizPlatform = 'kahoot' | 'wayground' | 'universal';
+
+export type HighlightStyle = 'gold' | 'stealth';
 
 export type QuestionKind = 'choice' | 'fill_blank';
 
@@ -31,6 +33,8 @@ export interface EngineSettings {
   openRouterApiKey: string;
   consensusMode: ConsensusMode;
   antiFocusLoss: boolean;
+  universalHighlightEnabled: boolean;
+  highlightStyle: HighlightStyle;
   pinnedContext: string;
   triggerMode: TriggerMode;
   targetScore: number;
@@ -73,6 +77,7 @@ export interface AnswerResolution {
   timestamp: number;
   multiSelect?: boolean;
   triggerMode?: TriggerMode;
+  highlightStyle?: HighlightStyle;
   targetScore?: number;
   minDelayMs?: number;
   maxDelayMs?: number;
@@ -251,12 +256,20 @@ export type RuntimeRequestMessage =
       quizId: string;
     }
   | {
+      type: 'TRIGGER_UNIVERSAL_SCAN';
+      tabId?: number;
+    }
+  | {
       type: 'GET_ENGINE_STATUS';
     };
 
 export type ContentPushMessage =
   | {
       type: 'PING_CONTENT_ENGINE';
+    }
+  | {
+      type: 'SCAN_UNIVERSAL_PAGE';
+      force: boolean;
     }
   | {
       type: 'APPLY_RESOLVED_ANSWER';
@@ -267,6 +280,13 @@ export type ContentPushMessage =
       message: string;
       isError?: boolean;
     };
+
+export interface RuntimeScanResponse {
+  ok: boolean;
+  detectedCount: number;
+  solvedCount: number;
+  error?: string;
+}
 
 export interface RuntimeResolveResponse {
   ok: boolean;

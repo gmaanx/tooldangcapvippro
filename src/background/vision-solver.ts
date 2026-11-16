@@ -394,7 +394,7 @@ export async function resolveViaVisionCapture(
       }
     }
 
-    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 8));
+    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 12));
     const systemInstruction = buildQuizSystemInstruction(
       multiSelect,
       safeOptionCount,
@@ -403,7 +403,7 @@ export async function resolveViaVisionCapture(
 
     const mappingLines = buildVisionOptionMappingLines(safeOptionCount);
     const promptLines: string[] = [
-      'Inspect this quiz screen (Kahoot or Wayground/Quizizz), including any embedded diagram, chart, or mathematical formula.',
+      'Inspect this quiz screen (Kahoot, Wayground/Quizizz, or LMS/exam page), including any embedded diagram, chart, or mathematical formula.',
       'Answer option zero-based index mapping:',
       ...mappingLines,
     ];

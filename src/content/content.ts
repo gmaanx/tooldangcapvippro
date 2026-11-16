@@ -668,7 +668,55 @@ function extractHostChoiceTexts(): string[] {
     .map((item) => item[1]);
 }
 
+const STEALTH_HIGHLIGHT_KEY = 'khe-stealth-answer';
+const STEALTH_OUTLINE_FALLBACK = '1px dotted rgba(148, 163, 184, 0.55)';
+let stealthStyleInjected = false;
+
+function ensureStealthHighlightStylesheet(): void {
+  if (stealthStyleInjected || !document.head) {
+    return;
+  }
+  stealthStyleInjected = true;
+  const styleEl = document.createElement('style');
+  styleEl.setAttribute('data-khe-stealth-style', '1');
+  styleEl.textContent =
+    '::highlight(khe-stealth-answer){text-decoration-line:underline;text-decoration-style:dotted;text-decoration-color:rgba(148,163,184,0.72);text-decoration-thickness:1.5px;text-underline-offset:3px;}';
+  document.head.appendChild(styleEl);
+}
+
+function collectElementTextRanges(root: HTMLElement): Range[] {
+  const ranges: Range[] = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    const raw = node.nodeValue ?? '';
+    const trimmed = raw.trim();
+    if (trimmed.length > 0 && node.parentElement) {
+      const start = raw.indexOf(trimmed);
+      if (start >= 0) {
+        const range = new Range();
+        range.setStart(node, start);
+        range.setEnd(node, start + trimmed.length);
+        ranges.push(range);
+      }
+    }
+    node = walker.nextNode();
+  }
+  return ranges;
+}
+
+function clearStealthCustomHighlights(): void {
+  try {
+    if (typeof CSS !== 'undefined' && 'highlights' in CSS && CSS.highlights) {
+      CSS.highlights.delete(STEALTH_HIGHLIGHT_KEY);
+    }
+  } catch {
+    void 0;
+  }
+}
+
 function clearAllAnswerHighlights(): void {
+  clearStealthCustomHighlights();
   const buttonSel = IS_WAYGROUND
     ? WAYGROUND_SELECTORS.ALL_OPTION_CANDIDATES
     : SELECTORS.ANSWER_PREFIX;
@@ -711,12 +759,43 @@ function applyHighlightToTargets(indices: number[]): boolean {
     ? getVisibleAnswerButtons()
     : Array.from(document.querySelectorAll<HTMLElement>(SELECTORS.ANSWER_PREFIX));
 
+  const useStealth = currentSettings.highlightStyle === 'stealth';
+  clearStealthCustomHighlights();
+
   allButtons.forEach((btn) => {
-    if (!wantedButtons.has(btn) && btn.style.outline) {
+    if ((!wantedButtons.has(btn) || useStealth) && btn.style.outline) {
       btn.style.outline = '';
       btn.style.outlineOffset = '';
     }
   });
+
+  if (useStealth) {
+    ensureStealthHighlightStylesheet();
+    const supportsCustomHighlights =
+      typeof CSS !== 'undefined' &&
+      'highlights' in CSS &&
+      Boolean(CSS.highlights) &&
+      typeof Highlight !== 'undefined';
+    const textRanges: Range[] = [];
+
+    for (const targetButton of wantedButtons) {
+      const btnRanges = supportsCustomHighlights
+        ? collectElementTextRanges(targetButton)
+        : [];
+      if (btnRanges.length > 0) {
+        textRanges.push(...btnRanges);
+      } else {
+        targetButton.style.outline = STEALTH_OUTLINE_FALLBACK;
+        targetButton.style.outlineOffset = '-1px';
+      }
+    }
+
+    if (supportsCustomHighlights && textRanges.length > 0) {
+      CSS.highlights.set(STEALTH_HIGHLIGHT_KEY, new Highlight(...textRanges));
+    }
+
+    return wantedButtons.size > 0;
+  }
 
   for (const targetButton of wantedButtons) {
     if (targetButton.style.outline !== HIGHLIGHT_OUTLINE_CSS) {
@@ -735,9 +814,13 @@ function applyHighlightToBlankInputs(
   if (inputs.length === 0) {
     return false;
   }
+  const useStealth = currentSettings.highlightStyle === 'stealth';
+  const outlineCss = useStealth
+    ? STEALTH_OUTLINE_FALLBACK
+    : HIGHLIGHT_OUTLINE_CSS;
   for (const inp of inputs) {
-    if (inp.style.outline !== HIGHLIGHT_OUTLINE_CSS) {
-      inp.style.outline = HIGHLIGHT_OUTLINE_CSS;
+    if (inp.style.outline !== outlineCss) {
+      inp.style.outline = outlineCss;
       inp.style.outlineOffset = '-1px';
     }
   }
@@ -746,7 +829,7 @@ function applyHighlightToBlankInputs(
     if (!single.hasAttribute('data-hybrid-orig-ph')) {
       single.setAttribute('data-hybrid-orig-ph', single.placeholder || '');
     }
-    const hintText = `Answer: ${fillText}`;
+    const hintText = useStealth ? fillText : `Answer: ${fillText}`;
     if (single.placeholder !== hintText) {
       single.placeholder = hintText;
     }
@@ -1114,6 +1197,12 @@ function schedulePendingCommitRetry(): void {
 }
 
 function syncSettingsFromResolution(resolution: AnswerResolution): void {
+  if (resolution.highlightStyle) {
+    currentSettings = {
+      ...currentSettings,
+      highlightStyle: resolution.highlightStyle,
+    };
+  }
   if (resolution.triggerMode) {
     currentSettings = {
       ...currentSettings,
@@ -1371,7 +1460,10 @@ function formatResolutionHudToast(
 }
 
 function showHudToast(message: string, isError = false, durationMs = 2600): void {
-  if (!document.body) {
+  if (!document.body || currentSettings.highlightStyle === 'stealth') {
+    if (hudToastTextEl) {
+      hudToastTextEl.style.opacity = '0';
+    }
     return;
   }
 
@@ -2247,10 +2339,14 @@ function initializeIsolatedContentEngine(): void {
     if (areaName === 'local' && changes[STORAGE_KEYS.SETTINGS]?.newValue) {
       const prevMode = currentSettings.triggerMode;
       const prevScore = currentSettings.targetScore;
+      const prevStyle = currentSettings.highlightStyle;
       const next = changes[STORAGE_KEYS.SETTINGS]
         .newValue as EngineSettings;
       currentSettings = next;
       syncWaygroundFocusGuardAttribute();
+      if (next.highlightStyle === 'stealth' && hudToastTextEl) {
+        hudToastTextEl.style.opacity = '0';
+      }
       if (!next.enabled) {
         clearScheduledTimers();
         requestAnimationFrame(clearAllAnswerHighlights);
@@ -2259,10 +2355,21 @@ function initializeIsolatedContentEngine(): void {
           activeRoundResolution = {
             ...activeRoundResolution,
             triggerMode: next.triggerMode,
+            highlightStyle: next.highlightStyle,
             targetScore: next.targetScore,
             minDelayMs: next.minDelayMs,
             maxDelayMs: next.maxDelayMs,
           };
+          if (prevStyle !== next.highlightStyle) {
+            if (activeRoundResolution.questionKind === 'fill_blank') {
+              applyHighlightToBlankInputs(
+                getVisibleBlankInputs(),
+                activeRoundResolution.fillText ?? ''
+              );
+            } else {
+              applyHighlightToTargets(activeRoundResolution.indices);
+            }
+          }
           if (
             (prevMode !== next.triggerMode || prevScore !== next.targetScore) &&
             scheduledJitterTimer !== null

@@ -1121,12 +1121,24 @@ async function sendCdpEnterKey(tabId: number): Promise<void> {
   });
 }
 
+async function isTabAllowedForTrustedAutoAction(tabId: number): Promise<boolean> {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return isSupportedTargetUrl(tab.url);
+  } catch {
+    return false;
+  }
+}
+
 async function performTrustedClickInternal(
   tabId: number,
   indices: number[],
   multiSelect: boolean,
   submitOnly: boolean
 ): Promise<RuntimeClickResponse> {
+  if (!(await isTabAllowedForTrustedAutoAction(tabId))) {
+    return { ok: false };
+  }
   const dedupKey = `${tabId}:${submitOnly ? 'sub' : indices.join(',')}:${multiSelect ? '1' : '0'}`;
   const now = Date.now();
   const lastAt = recentClickTimestamps.get(dedupKey) ?? 0;
@@ -1213,6 +1225,9 @@ async function performTrustedTextFillInternal(
 ): Promise<RuntimeClickResponse> {
   const trimmed = fillText.trim();
   if (!trimmed) {
+    return { ok: false };
+  }
+  if (!(await isTabAllowedForTrustedAutoAction(tabId))) {
     return { ok: false };
   }
 

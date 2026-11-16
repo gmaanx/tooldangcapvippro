@@ -1,15 +1,16 @@
 # KahootHybridEngine
 
-A Manifest V3 Chromium extension (TypeScript + Vite) engineered for real-time quiz question extraction, multi-provider parallel LLM consensus resolution, score-paced execution, focus-loss suppression, and hardware-level trusted input dispatch (`Event.isTrusted === true`) across **Kahoot** and **Wayground (Quizizz)**.
+A Manifest V3 Chromium extension (TypeScript + Vite) engineered for real-time quiz question extraction, multi-provider parallel LLM consensus resolution, score-paced execution on **Kahoot** and **Wayground (Quizizz)**, and **strictly Highlight-Only** answer indication across **Universal LMS platforms and custom instructor websites**.
 
 ---
 
-## Supported Platforms & Capabilities
+## Supported Platforms & Execution Policies
 
-| Platform | Supported Domains | Supported Question Formats & Features |
-| :--- | :--- | :--- |
-| **Kahoot** | `kahoot.it`, `play.kahoot.it`, `create.kahoot.it` | Single-Choice (`2-4` tiles), Multi-Select (`MSQ + Submit`), Challenge/UUID `0ms` pre-fetch, Host-Only Vision & Clipboard solving, Target Score stealth pacing |
-| **Wayground (Quizizz)** | `wayground.com`, `quizizz.com`, `joinmyquiz.com` *(including subdomains)* | Single-Choice (`2-8` options), Multi-Select (`MSQ + Submit`), Fill-in-the-Blank / Short Text Auto-Type (single input & character-slot grids), KaTeX / MathJax formula extraction, Embedded Stem-Image Vision solving, Redemption Question `0ms` replay, Anti Focus-Loss (`Test Mode`) |
+| Platform | Target Domains | Execution Policy | Supported Question Formats & Features |
+| :--- | :--- | :--- | :--- |
+| **Kahoot** | `kahoot.it`, `play.kahoot.it`, `create.kahoot.it` | Auto-Click / Target Score / Highlight | Single-Choice (`2-4` tiles), Multi-Select (`MSQ + Submit`), Challenge/UUID `0ms` pre-fetch, Host-Only Vision & Clipboard solving, Target Score stealth pacing |
+| **Wayground (Quizizz)** | `wayground.com`, `quizizz.com`, `joinmyquiz.com` *(and subdomains)* | Auto-Click / Auto-Type / Target Score / Highlight | Single-Choice (`2-8` options), Multi-Select (`MSQ + Submit`), Fill-in-the-Blank / Short Text Auto-Type, KaTeX / MathJax formula extraction, Embedded Stem-Image Vision, Redemption `0ms` replay, Anti Focus-Loss (`Test Mode`) |
+| **Universal LMS & Custom Web** | Moodle (`lms.*`), Canvas, Google Forms, Microsoft Forms, Blackboard, Azota, Shub, custom HTTP/HTTPS quiz apps | **Strictly Highlight-Only** *(Zero Auto-Click, Zero Auto-Submit, Zero Debugger)* | Single & Multi-Question pages (`2-12` options), Native Radio/Checkbox & ARIA (`radiogroup`) apps, Short-Answer hints, KaTeX / MathJax / LaTeX `alt` extraction, Moodle Review answer harvesting, **Gold Outline** & **Stealth Mode** (`CSS.highlights`), Selection & Manual Scan (`Alt+Shift+S`) |
 
 ---
 
@@ -19,20 +20,18 @@ The engine operates as a four-tier resolution pipeline designed to minimize late
 
 1. **Tier 1 — Pre-fetched Quiz & Self-Learning Cache (`0-5ms`)**
    - Pre-fetches and indexes quiz payloads from Kahoot REST endpoints whenever a public Challenge URL (`kahoot.it/challenge/...`) or Quiz UUID is available.
-   - Maintains a persistent local LRU question bank (up to 1,500 entries in `chrome.storage.local`) storing both normalized choice answers (resilient to option shuffling) and verified Fill-in-the-Blank strings, enabling `0ms` instant resolution on retakes and Wayground Redemption Questions.
+   - Maintains a persistent local LRU question bank (up to 1,500 entries in `chrome.storage.local`) storing normalized choice texts (resilient to option shuffling) and verified Fill-in-the-Blank strings, enabling `0ms` resolution on retakes, Wayground Redemption rounds, and repeated LMS attempts. Automatically harvests verified answers from Moodle quiz review pages (`.outcome .rightanswer`).
 
-2. **Tier 2 — Protocol Interceptor, Focus Guard, Score Pacer & CDP Input Dispatcher**
-   - Intercepts Kahoot CometD WebSocket frames in the `MAIN` execution world to capture question timers (`timeAvailableMs`) and synchronize state between Host and Player tabs, while extracting KaTeX (`application/x-tex`) and MathJax (`aria-label`) expressions directly from Wayground DOM trees.
-   - Installs a `document_start` focus guard on Wayground domains (`Anti Focus-Loss`) that neutralizes `visibilitychange`, `webkitvisibilitychange`, `mouseleave`, and window/document `blur` telemetry without interfering with internal `<input>` validation events.
-   - Computes inverse score-decay delays (`Target Score Pacing`) so automated executions land within a configurable point band rather than constantly scoring maximum speed points.
-   - Dispatches hardware-level mouse clicks (`Input.dispatchMouseEvent`) and native text insertion (`Input.insertText`) over Chrome DevTools Protocol (`1.3`), satisfying `Event.isTrusted === true` checks across single-choice, multi-select, and fill-in-the-blank rounds.
+2. **Tier 2 — Platform Interceptors, Universal LMS Scanner & Scoped CDP Dispatcher**
+   - **Kahoot & Wayground:** Intercepts Kahoot CometD WebSocket frames, installs a `document_start` Wayground focus guard (`Anti Focus-Loss`), computes inverse score-decay delays (`Target Score Pacing`), and dispatches hardware-level mouse clicks (`Input.dispatchMouseEvent`) and text insertion (`Input.insertText`) over Chrome DevTools Protocol (`1.3`).
+   - **Universal LMS & Custom Websites (`universal-lms.ts`):** Runs an isolated multi-adapter extractor covering Moodle (`div.que`), Canvas (`.display_question`), Google Forms, Microsoft Forms, native `<input type="radio"|"checkbox">` groups, ARIA `[role="radiogroup"]` components, and custom lecturer quiz cards. Prioritizes viewport-visible questions with concurrency throttling and enforces a hard **Highlight-Only** boundary so `chrome.debugger` never attaches outside Kahoot and Wayground.
 
 3. **Tier 3 — Multi-Provider AI Consensus Engine**
-   - Executes concurrent low-latency inference across **Groq**, **Google Gemini**, and **OpenRouter**, spanning distinct model families (`Llama-4`, `Qwen-3`, `Gemini Flash`, `DeepSeek`) for both indexed choices (`0-7`) and exact-string fill-in-the-blank prompts.
+   - Executes concurrent low-latency inference across **Groq**, **Google Gemini**, and **OpenRouter**, spanning distinct model families (`Llama-4`, `Qwen-3`, `Gemini Flash`, `DeepSeek`) for both indexed choices (`0-11`) and exact-string fill-in-the-blank prompts.
    - Aggregates responses via weighted majority voting (*Multi-AI Consensus Vote*) to eliminate single-model hallucinations, with automatic offline fallback to Chrome Built-in AI (`LanguageModel`) when available.
 
 4. **Tier 4 — Multimodal Vision & Clipboard Solver**
-   - Compresses viewport captures and system clipboard images via `OffscreenCanvas` (`WebP`), racing multimodal vision models automatically when Wayground stems contain diagrams/formula images or when Kahoot runs in Host-Only display mode.
+   - Compresses viewport captures and system clipboard images via `OffscreenCanvas` (`WebP`), racing multimodal vision models when Wayground stems contain diagrams, when Kahoot runs in Host-Only display mode, or when manually invoked on visual exam pages.
 
 ---
 
@@ -47,7 +46,7 @@ The repository includes a production build inside `dist/`, allowing immediate in
    git clone https://github.com/gmaanx/tooldangcapvippro.git
    ```
    Alternatively, click **Code > Download ZIP** on GitHub and extract the archive locally.
-2. Open any Chromium-based browser (Google Chrome, Microsoft Edge, Brave) and navigate to:
+2. Open any Chromium-based browser (Google Chrome, Microsoft Edge, Brave, Arc) and navigate to:
    ```text
    chrome://extensions
    ```
@@ -72,7 +71,7 @@ Once compilation succeeds, load the generated `dist/` directory in `chrome://ext
 
 ## API Key Configuration
 
-Open the **KahootHybridEngine** popup from the browser toolbar and enter your API keys under **2. Multi-AI Ensemble & API Keys**. All credentials are stored strictly locally in `chrome.storage.local` and are transmitted exclusively over HTTPS to their respective provider endpoints. Both Kahoot and Wayground share the same API key configuration.
+Open the **KahootHybridEngine** popup from the browser toolbar and enter your API keys under **3. Multi-AI Ensemble & API Keys**. All credentials are stored strictly locally in `chrome.storage.local` and are transmitted exclusively over HTTPS to their respective provider endpoints. Kahoot, Wayground, and Universal LMS share the same API key configuration.
 
 Only **one API key** (recommended: **Groq**) is required for operation. Configuring **two or all three providers** maximizes cross-model verification under **Multi-AI Consensus Vote**.
 
@@ -102,69 +101,65 @@ Click **Save Configuration** after entering your keys to persist settings and pr
 
 ---
 
-## Execution Modes, Focus Protection & Shortcuts
+## Execution Modes, Highlight Styles & Shortcuts
 
-### Execution Modes
+### 1. Kahoot & Wayground Execution Modes
 
-Configured under **1. Execution & Point Pacing** in the popup (changes apply immediately to active Kahoot and Wayground tabs):
+Configured under **1. Kahoot & Wayground Execution** in the popup (applies exclusively to Kahoot and Wayground; external websites always enforce Highlight-Only):
 
 | Mode | Behavior | Recommended Use Case |
 | :--- | :--- | :--- |
-| `Instant Auto-Click (+1000 pts)` | Dispatches hardware-trusted option clicks (or auto-types and submits Fill-in-the-Blank answers) immediately upon resolution (`~150-300ms`). | Maximum speed and top possible score per question. |
-| `Target Score Auto-Click (Stealth Points)` | Highlights the resolved option or previews the fill-blank answer immediately (`0ms`), then calculates a dynamic wait interval scaled to the question timer to hit your target score (`600`-`1000` pts with `+/-25` natural variance). | Live sessions where instantaneous maximum-score answers on every round are undesirable (presets: `~930`, `~860`, `~760`, `~660`). |
+| `Instant Auto-Click (+1000 pts)` | Dispatches hardware-trusted option clicks (or auto-types Fill-in-the-Blank answers) immediately upon resolution (`~150-300ms`). | Maximum speed and top possible score on Kahoot & Wayground. |
+| `Target Score Auto-Click (Stealth Points)` | Highlights the resolved option immediately (`0ms`), then calculates a dynamic wait interval scaled to the question timer to hit your target score (`600`-`1000` pts with `+/-25` natural variance). | Live sessions where instantaneous maximum-score answers on every round are undesirable. |
 | `Custom Delay (ms)` | Waits a randomized interval bounded by `Min Delay (ms)` and `Max Delay (ms)` before clicking or typing. | Fixed reaction-time simulation independent of question timer length. |
-| `Highlight Only` | Outlines the correct option(s) in gold (or displays a non-intrusive answer badge on Fill-in-the-Blank inputs) without attaching `chrome.debugger` or submitting. | Manual answering with zero browser debugger attachment. |
+| `Highlight Only` | Outlines the correct option(s) without attaching `chrome.debugger` or clicking. | Manual answering across all platforms. |
 
-### Anti Focus-Loss (Wayground Test Mode)
+### 2. Universal LMS & Highlight Visual Styles
 
-Enabled by default in **1. Execution & Point Pacing**. When active on `wayground.com`, `quizizz.com`, and `joinmyquiz.com`, the `MAIN`-world guard overrides `Document.prototype.visibilityState`, `Document.prototype.hidden`, and `Document.prototype.hasFocus()`, and intercepts capture-phase window/document `blur`, `mouseleave`, and `visibilitychange` events so opening the extension popup or snipping screenshots does not trigger tab-switch warnings.
+Configured under **2. Universal LMS & Highlight Style**:
 
-### Keyboard Shortcuts
+| Style | Visual Rendering | Recommended Environment |
+| :--- | :--- | :--- |
+| `Gold Outline` | Renders a crisp amber-gold border and subtle background tint around winning choice rows, or a compact answer pill adjacent to short-answer inputs. | Personal study, self-paced online LMS quizzes, and remote sessions. |
+| `Stealth Mode` | Uses the CSS Custom Highlight API (`CSS.highlights` / `::highlight()`) to apply a faint dotted underline directly to text ranges without inserting DOM nodes into choice labels, and suppresses all on-page toast notifications. | Proctored computer labs and lecture halls where high-contrast borders or popups are undesirable. |
 
-Customizable at `chrome://extensions/shortcuts`:
+### 3. Keyboard Shortcuts
+
+Customizable at `chrome://extensions/shortcuts` (on macOS, `Alt` maps to `Option`):
 
 | Shortcut | Action |
 | :--- | :--- |
-| `Alt + Shift + Q` | Captures the active Kahoot or Wayground tab viewport and resolves the answer via Vision AI. |
-| `Alt + Shift + V` | Reads an image or copied text from the system clipboard and resolves the corresponding option or blank input. |
-| `Ctrl + V` *(on active quiz tab)* | Pastes a snipped screenshot directly into an active Kahoot or Wayground page for immediate Vision resolution (ignored when typing inside a text input). |
+| `Alt + Shift + S` | Scans and highlights all quiz questions on the active LMS or custom instructor webpage (if text is selected with the mouse, solves the selected passage directly). |
+| `Alt + Shift + Q` | Captures the active tab viewport and resolves the answer via Vision AI. |
+| `Alt + Shift + V` | Reads an image or copied text from the system clipboard and resolves the corresponding answer. |
+| `Ctrl + V` / `Cmd + V` | Pastes a snipped screenshot directly into the active quiz page for immediate Vision resolution (ignored when focused inside a text input). |
 
 ---
 
 ## Operational Notes
 
-### 1. `chrome.debugger` Lifecycle & Hiding the Browser Debugging Banner
+### 1. Strict Highlight-Only Isolation on External Websites
 
-Modern quiz frontends validate `Event.isTrusted` on pointer and keyboard events and ignore synthetic DOM calls. To dispatch genuine browser-level mouse clicks and `Input.insertText` keystrokes, the extension attaches `chrome.debugger` during automated modes.
+Outside `kahoot.it` and `wayground.com` / `quizizz.com` / `joinmyquiz.com`, the service worker and trusted clicker enforce a hard URL and platform lock:
+- `chrome.debugger` **never** attaches on LMS portals or custom instructor websites, meaning Chrome's top debugging infobar will never appear on those sites.
+- No synthetic clicks, form value mutations, or automatic submissions are ever dispatched on external pages.
 
-- **Automatic Lifecycle Management:** The extension does **not** attach the debugger on PIN/code entry or lobby screens (`/`, `/join`, `/pro/join`, `/instructions`). It attaches strictly during active gameplay routes and automatically detaches as soon as the session reaches summary or leaderboard routes (`/gameover`, `/ranking`, `/podium`, `/summary`).
-- **Do not click `Cancel` or `x`** on Chrome's debugging infobar during an active question round, as doing so revokes trusted click and auto-type permissions for that tab.
+### 2. `chrome.debugger` Banner Suppression (Optional, for Kahoot & Wayground Auto-Click)
 
-**Optional: Permanently Suppress the Debugging Infobar in Chrome**
+When using Auto-Click / Auto-Type modes on Kahoot or Wayground, Chromium displays a debugging infobar while `chrome.debugger` is attached. You can optionally hide this banner browser-wide with Chromium's `--silent-debugger-extension-api` flag:
 
-Chromium provides the official `--silent-debugger-extension-api` launch switch to hide the debugging infobar completely:
+- **Windows:** Append `--silent-debugger-extension-api` to the Google Chrome shortcut **Target** field:
+  ```text
+  "C:\Program Files\Google\Chrome\Application\chrome.exe" --silent-debugger-extension-api
+  ```
+- **macOS:** Quit Chrome (`Cmd + Q`) and launch via Terminal:
+  ```bash
+  open -a "Google Chrome" --args --silent-debugger-extension-api
+  ```
 
-1. Close all running Google Chrome windows (including background tray processes).
-2. Right-click your **Google Chrome** desktop shortcut (or Start Menu shortcut via *Open file location*) and select **Properties**.
-3. In the **Shortcut** tab, locate the **Target** field and append `--silent-debugger-extension-api` after the closing quotation mark (separated by a single space):
-   ```text
-   "C:\Program Files\Google\Chrome\Application\chrome.exe" --silent-debugger-extension-api
-   ```
-4. Click **Apply** > **OK**, and launch Chrome using that shortcut.
+### 3. Avoid DevTools (`F12`) Conflicts on Active Kahoot / Wayground Tabs
 
-### 2. Avoid DevTools (`F12`) Conflicts on the Active Game Tab
-
-Chromium restricts each tab to a single active debugger session. Keep the `F12` DevTools inspector closed on the active `kahoot.it`, `wayground.com`, `quizizz.com`, or `joinmyquiz.com` tab while using Auto-Click / Auto-Type modes.
-
-### 3. Live Classroom PINs / Game Codes vs. Kahoot Challenge UUIDs
-
-- **Live Classroom PINs & Wayground Game Codes (`6-8` digits):** Live sessions stream questions dynamically and require zero pre-game setup. Join with your game code normally and the Multi-AI Consensus pipeline will detect, resolve, and execute each round automatically.
-- **Kahoot Self-Paced Challenges (`kahoot.it/challenge/...`) or Known Quiz UUIDs:** Expand *Optional: Lecture Notes, Challenge Cache & Quick Join PIN* in the popup, paste the URL or UUID, and click **Join PIN / Cache Challenge** to pre-load `0ms` Tier 1 answers.
-
-### 4. Visual Diagrams, Math Equations & Host-Only Screens
-
-- **Wayground Stem Images & Formulas:** Embedded `.katex` and `mjx-container` formulas are converted into clean TeX strings before querying text models, while questions containing stem diagrams (`<img>`, `<svg>`, `<canvas>`) automatically invoke Multimodal Vision alongside DOM stem/option text.
-- **Host-Only Projected Questions:** Capture the projected question into your clipboard (`Win + Shift + S` on Windows or `Cmd + Shift + Ctrl + 4` on macOS), switch to the quiz tab, and press `Ctrl + V` (or `Alt + Shift + V`).
+Chromium restricts each tab to a single active debugger session. Keep the `F12` DevTools inspector closed on active Kahoot or Wayground tabs while using Auto-Click modes.
 
 ---
 
@@ -180,26 +175,27 @@ Chromium restricts each tab to a single active debugger session. Keep the `F12` 
 │   │   ├── ai-racer.ts          # Parallel multi-provider inference & consensus voting (choice + fill-blank)
 │   │   ├── clipboard-solver.ts  # Image and text resolution from system clipboard payloads
 │   │   ├── quiz-cache.ts        # Tier 1 REST pre-fetcher & persistent self-learning LRU bank
-│   │   ├── service-worker.ts    # Background event router, tab lifecycle & message bus
-│   │   ├── trusted-clicker.ts   # CDP debugger manager, hardware mouse clicker & text auto-typer
+│   │   ├── service-worker.ts    # Background router, highlight-only external lock & scan coordinator
+│   │   ├── trusted-clicker.ts   # Kahoot/Wayground-scoped CDP debugger clicker & text auto-typer
 │   │   └── vision-solver.ts     # Visible-tab capture, WebP compression & multimodal solver
 │   ├── content/
 │   │   ├── content.ts           # Kahoot/Wayground DOM observer, KaTeX parser & score-paced executor
-│   │   └── injector.ts          # MAIN-world WebSocket/Fetch proxy & Wayground focus-loss guard
+│   │   ├── injector.ts          # Kahoot/Wayground MAIN-world WebSocket proxy & focus-loss guard
+│   │   └── universal-lms.ts     # Highlight-only multi-adapter scanner for LMS & custom quiz websites
 │   ├── offscreen/
 │   │   ├── offscreen.html       # Offscreen document host for canvas & clipboard operations
 │   │   └── offscreen.ts         # OffscreenCanvas downscaling and clipboard extraction
 │   ├── popup/
 │   │   ├── index.html           # Extension configuration UI
 │   │   ├── popup.css            # Popup stylesheet
-│   │   └── popup.ts             # Settings synchronization, validation & live telemetry view
+│   │   └── popup.ts             # Settings synchronization, page scan trigger & live telemetry view
 │   └── shared/
 │       ├── constants.ts         # Platform selectors, API endpoints, model lists & defaults
 │       ├── normalize.ts         # Hostname matchers, text/blank parsers, FNV-1a hashing & score math
 │       ├── storage.ts           # Persistent storage helpers for chrome.storage.local/session
 │       └── types.ts             # Strict TypeScript interfaces and message contracts
-├── manifest.json                # Chrome Extension Manifest V3 declaration (v1.1.0)
+├── manifest.json                # Chrome Extension Manifest V3 declaration (v1.2.0)
 ├── package.json                 # Build scripts and dependencies
 ├── tsconfig.json                # Strict TypeScript compiler configuration
-└── vite.config.ts               # Multi-entry Vite bundler (Popup, Service Worker, Content IIFE)
+└── vite.config.ts               # Multi-entry Vite bundler (Popup, Service Worker, Content IIFEs)
 ```

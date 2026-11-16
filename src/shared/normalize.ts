@@ -113,6 +113,15 @@ export function buildQuestionStateHash(
   );
 }
 
+export function stripLeadingOptionPrefix(raw: string): string {
+  if (!raw) {
+    return '';
+  }
+  return raw
+    .replace(/^\s*(?:\(?[A-La-l1-9]\)?[.):\-]\s+|(?:Option|Choice|Câu|Đáp án)\s+[A-La-l1-9][.):\-]?\s+)/i, '')
+    .trim();
+}
+
 export function parseAnswerIndices(
   rawOutput: string,
   optionCount = 4,
@@ -121,12 +130,12 @@ export function parseAnswerIndices(
   if (!rawOutput) {
     return [];
   }
-  const upperBound = Math.max(1, Math.min(optionCount, 8)) - 1;
+  const upperBound = Math.max(1, Math.min(optionCount, 12)) - 1;
   const strippedThink = rawOutput
     .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
     .replace(/<think>[\s\S]*$/gi, ' ')
     .trim();
-  const digitMatches = strippedThink.match(/\b[0-7]\b/g);
+  const digitMatches = strippedThink.match(/\b(?:1[01]|[0-9])\b/g);
   if (!digitMatches || digitMatches.length === 0) {
     return [];
   }

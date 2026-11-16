@@ -23,6 +23,8 @@ export const DEFAULT_SETTINGS: EngineSettings = {
   openRouterApiKey: '',
   consensusMode: 'consensus_vote',
   antiFocusLoss: true,
+  universalHighlightEnabled: true,
+  highlightStyle: 'gold',
   pinnedContext: '',
   triggerMode: 'instant_auto_click',
   targetScore: 860,

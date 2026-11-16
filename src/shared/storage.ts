@@ -59,6 +59,14 @@ export async function loadSettings(): Promise<EngineSettings> {
       typeof raw.antiFocusLoss === 'boolean'
         ? raw.antiFocusLoss
         : DEFAULT_SETTINGS.antiFocusLoss,
+    universalHighlightEnabled:
+      typeof raw.universalHighlightEnabled === 'boolean'
+        ? raw.universalHighlightEnabled
+        : DEFAULT_SETTINGS.universalHighlightEnabled,
+    highlightStyle:
+      raw.highlightStyle === 'gold' || raw.highlightStyle === 'stealth'
+        ? raw.highlightStyle
+        : DEFAULT_SETTINGS.highlightStyle,
     pinnedContext:
       typeof raw.pinnedContext === 'string'
         ? raw.pinnedContext

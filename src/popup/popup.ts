@@ -16,10 +16,12 @@ import type {
   ContentPushMessage,
   EngineSettings,
   EngineTelemetry,
+  HighlightStyle,
   ResolutionTier,
   RuntimeCacheResponse,
   RuntimeRequestMessage,
   RuntimeResolveResponse,
+  RuntimeScanResponse,
   RuntimeStatusResponse,
   TriggerMode,
 } from '../shared/types';
@@ -104,7 +106,8 @@ async function findPopupTargetKahootTab(): Promise<chrome.tabs.Tab | undefined> 
   if (
     activeTab &&
     typeof activeTab.id === 'number' &&
-    isSupportedQuizUrl(activeTab.url)
+    activeTab.url &&
+    (activeTab.url.startsWith('https://') || activeTab.url.startsWith('http://'))
   ) {
     return activeTab;
   }
@@ -338,6 +341,14 @@ function populateForm(settings: EngineSettings): void {
     settings.consensusMode !== 'fastest_first';
   queryRequired<HTMLInputElement>('#anti-focus-loss').checked =
     settings.antiFocusLoss !== false;
+  queryRequired<HTMLInputElement>('#universal-highlight-enabled').checked =
+    settings.universalHighlightEnabled !== false;
+  const styleRadio = document.querySelector<HTMLInputElement>(
+    `input[name="highlightStyle"][value="${settings.highlightStyle ?? 'gold'}"]`
+  );
+  if (styleRadio) {
+    styleRadio.checked = true;
+  }
   queryRequired<HTMLInputElement>('#quiz-id').value = settings.quizId;
   queryRequired<HTMLInputElement>('#min-delay-ms').value = String(
     settings.minDelayMs
@@ -373,6 +384,14 @@ function readFormSettings(): EngineSettings {
     : 'fastest_first';
   const antiFocusLoss =
     queryRequired<HTMLInputElement>('#anti-focus-loss').checked;
+  const universalHighlightEnabled = queryRequired<HTMLInputElement>(
+    '#universal-highlight-enabled'
+  ).checked;
+  const selectedStyleRadio = document.querySelector<HTMLInputElement>(
+    'input[name="highlightStyle"]:checked'
+  );
+  const highlightStyle: HighlightStyle =
+    selectedStyleRadio?.value === 'stealth' ? 'stealth' : 'gold';
   const rawQuizInput = queryRequired<HTMLInputElement>('#quiz-id').value.trim();
   const normalizedIdentifier =
     extractUuid(rawQuizInput) ?? extractGamePin(rawQuizInput) ?? rawQuizInput;
@@ -426,6 +445,8 @@ function readFormSettings(): EngineSettings {
     ).value.trim(),
     consensusMode,
     antiFocusLoss,
+    universalHighlightEnabled,
+    highlightStyle,
     pinnedContext: queryRequired<HTMLTextAreaElement>('#pinned-context').value,
     triggerMode,
     targetScore,
@@ -447,10 +468,14 @@ async function initializePopup(): Promise<void> {
   const clearCacheBtn = queryRequired<HTMLButtonElement>('#clear-cache-btn');
   const visionNowBtn = queryRequired<HTMLButtonElement>('#vision-now-btn');
   const clipboardNowBtn = queryRequired<HTMLButtonElement>('#clipboard-now-btn');
+  const scanPageBtn = queryRequired<HTMLButtonElement>('#scan-page-btn');
   const targetScoreSlider = queryRequired<HTMLInputElement>('#target-score');
   const consensusCheckbox = queryRequired<HTMLInputElement>('#consensus-mode');
   const antiFocusCheckbox =
     queryRequired<HTMLInputElement>('#anti-focus-loss');
+  const universalHighlightCheckbox = queryRequired<HTMLInputElement>(
+    '#universal-highlight-enabled'
+  );
 
   installValidationSync(form);
   bindPasswordToggle('#toggle-groq-key', '#groq-api-key', 'Groq API key');
@@ -527,6 +552,71 @@ async function initializePopup(): Promise<void> {
         ? 'Anti Focus-Loss enabled on Wayground.'
         : 'Anti Focus-Loss disabled.'
     );
+  });
+
+  universalHighlightCheckbox.addEventListener('change', async () => {
+    await saveSettings({
+      universalHighlightEnabled: universalHighlightCheckbox.checked,
+    });
+    showStatus(
+      universalHighlightCheckbox.checked
+        ? 'External LMS & Custom Web Highlight-Only enabled.'
+        : 'External LMS auto-scan paused (Alt+Shift+S manual scan still available).'
+    );
+  });
+
+  form
+    .querySelectorAll<HTMLInputElement>('input[name="highlightStyle"]')
+    .forEach((radio) => {
+      radio.addEventListener('change', async () => {
+        const style: HighlightStyle =
+          radio.value === 'stealth' ? 'stealth' : 'gold';
+        await saveSettings({ highlightStyle: style });
+        showStatus(
+          style === 'stealth'
+            ? 'Stealth Highlight active (dotted text, zero on-page popups).'
+            : 'Gold Outline Highlight active.'
+        );
+      });
+    });
+
+  scanPageBtn.addEventListener('click', async () => {
+    scanPageBtn.disabled = true;
+    showStatus('Scanning active tab for quiz questions...');
+    const targetTab = await findPopupTargetKahootTab();
+    const scanRes = await sendMessage<RuntimeScanResponse>({
+      type: 'TRIGGER_UNIVERSAL_SCAN',
+      tabId: targetTab?.id,
+    });
+    scanPageBtn.disabled = false;
+
+    if (!scanRes || !scanRes.ok) {
+      showStatus(scanRes?.error ?? 'Unable to scan current tab.', true);
+      return;
+    }
+
+    if (scanRes.detectedCount === 0) {
+      showStatus(
+        'No structured questions found. Select question text & press Alt+Shift+S, or use Tab Vision (Alt+Shift+Q).',
+        true
+      );
+      return;
+    }
+
+    const refreshed = await sendMessage<RuntimeStatusResponse>({
+      type: 'GET_ENGINE_STATUS',
+    });
+    if (refreshed?.ok) {
+      renderTelemetry(refreshed.telemetry);
+    }
+
+    if (targetTab?.url && isSupportedQuizUrl(targetTab.url)) {
+      showStatus('Kahoot / Wayground engine active on current tab.');
+    } else {
+      showStatus(
+        `Highlighted ${scanRes.solvedCount}/${scanRes.detectedCount} question(s) (Highlight-Only).`
+      );
+    }
   });
 
   queryRequired<HTMLInputElement>('#engine-enabled').addEventListener(

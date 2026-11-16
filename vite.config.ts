@@ -17,6 +17,11 @@ function kahootContentScriptsPlugin(): Plugin {
       entry: resolve(currentDir, 'src/content/content.ts'),
       outFile: 'content.js',
     },
+    {
+      name: 'KahootUniversalLmsEngine',
+      entry: resolve(currentDir, 'src/content/universal-lms.ts'),
+      outFile: 'universal-lms.js',
+    },
   ];
 
   return {

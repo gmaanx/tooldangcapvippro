@@ -306,7 +306,7 @@ async function solveClipboardImage(
       };
     }
 
-    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 8));
+    const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 12));
     const systemInstruction = buildQuizSystemInstruction(
       multiSelect,
       safeOptionCount,
@@ -440,7 +440,7 @@ async function solveClipboardText(
     };
   }
 
-  const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 8));
+  const safeOptionCount = Math.max(2, Math.min(optionCount || 4, 12));
   const systemInstruction = buildQuizSystemInstruction(
     multiSelect,
     safeOptionCount,
