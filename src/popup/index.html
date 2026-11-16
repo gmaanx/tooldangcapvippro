@@ -41,7 +41,7 @@
     <form id="settings-form" action="#" method="post" novalidate>
       <fieldset class="panel">
         <legend>1. Kahoot &amp; Wayground Execution</legend>
-        <p class="live-ready-note">Auto-Click runs only on <code>kahoot.it</code> &amp; <code>wayground.com</code>. External LMS &amp; custom sites are locked to <strong>Highlight-Only</strong>.</p>
+        <p class="live-ready-note">Controls live speed &amp; target-score timing on <code>kahoot.it</code> &amp; <code>wayground.com</code>.</p>
         <div class="radio-group">
           <label class="radio-option" for="mode-instant">
             <input type="radio" id="mode-instant" name="triggerMode" value="instant_auto_click" checked>
@@ -152,12 +152,28 @@
       </fieldset>
 
       <fieldset class="panel">
-        <legend>2. Universal LMS &amp; Highlight Style</legend>
+        <legend>2. Universal LMS &amp; External Execution</legend>
         <label class="checkbox-card" for="universal-highlight-enabled">
           <input type="checkbox" id="universal-highlight-enabled" name="universalHighlightEnabled" class="visually-hidden-fallback" checked>
           <span>
-            <strong>External Sites &amp; LMS Auto-Highlight</strong>
-            <small>Moodle/UEH LMS, Canvas, Google/MS Forms &amp; custom quizzes (Highlight-Only, no auto-click)</small>
+            <strong>External Sites &amp; LMS Auto-Scan</strong>
+            <small>Automatically detects &amp; solves Moodle/UEH LMS, Canvas, Forms &amp; custom quizzes</small>
+          </span>
+        </label>
+
+        <label class="checkbox-card" for="lms-auto-click-enabled">
+          <input type="checkbox" id="lms-auto-click-enabled" name="lmsAutoClickEnabled" class="visually-hidden-fallback" checked>
+          <span>
+            <strong>LMS Auto-Click / Auto-Fill Answers</strong>
+            <small>Selects radios, checkboxes, dropdowns &amp; blanks automatically (never clicks Nộp bài / Submit)</small>
+          </span>
+        </label>
+
+        <label class="checkbox-card" id="lms-auto-next-card" for="lms-auto-next-page">
+          <input type="checkbox" id="lms-auto-next-page" name="lmsAutoNextPage" class="visually-hidden-fallback">
+          <span>
+            <strong>Auto-Advance Next Page (&ldquo;Trang tiếp&rdquo;)</strong>
+            <small>For 1-question-per-page quizzes: clicks Next after solving, stops on final question</small>
           </span>
         </label>
 
@@ -173,12 +189,12 @@
             <input type="radio" id="style-stealth" name="highlightStyle" value="stealth">
             <span>
               <strong>Stealth Mode</strong>
-              <small>Faint dotted text, no toast</small>
+              <small>Silent radio click / dotted text</small>
             </span>
           </label>
         </div>
 
-        <button type="button" id="scan-page-btn" class="secondary-btn scan-page-btn">Scan &amp; Highlight Current Page (Alt+Shift+S)</button>
+        <button type="button" id="scan-page-btn" class="secondary-btn scan-page-btn">Scan &amp; Solve Current Page (Alt+Shift+S)</button>
       </fieldset>
 
       <fieldset class="panel">

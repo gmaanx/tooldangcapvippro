@@ -47,7 +47,9 @@ interface UniversalQuestionBlock {
   questionText: string;
   options: string[];
   optionElements: HTMLElement[];
+  optionControls: HTMLElement[];
   selectControl?: HTMLSelectElement;
+  selectOptionValues?: string[];
   multiSelect: boolean;
   questionKind: QuestionKind;
   blankInputs: Array<HTMLInputElement | HTMLTextAreaElement>;
@@ -108,14 +110,24 @@ const QUESTION_STEM_SIGNAL_PATTERN =
 const MOODLE_NOISE_PREFIX_PATTERN =
   /^(?:question\s*text|select\s*one(?:\s*or\s*more)?\s*:?|chọn\s*một(?:\s*hoặc\s*nhiều)?\s*:?|flag\s*question|đặt\s*cờ|marked\s*out\s*of\s*[\d.,]+|đạt\s*điểm\s*[\d.,]+)\s*/gi;
 
+const FINAL_SUBMIT_DANGER_PATTERN =
+  /(?:nộp\s*bài|nop\s*bai|hoàn\s*thành|hoan\s*thanh|làm\s*xong|lam\s*xong|kết\s*thúc|ket\s*thuc|gửi\s*bài|gui\s*bai|submit|finish|end\s*(?:quiz|test|exam|attempt)|summary|xóa\s*lựa\s*chọn|clear\s*my\s*choice)/i;
+
+const NEXT_PAGE_SAFE_PATTERN =
+  /^(?:trang\s*tiếp(?:\s*theo)?|câu\s*tiếp(?:\s*theo)?|tiếp\s*tục|trang\s*sau|next\s*page|next\s*question|next)\s*[»›→>▶]*$/i;
+
 let currentSettings: EngineSettings = { ...DEFAULT_SETTINGS };
 let manualScanActivated = false;
 let styleSheetInjected = false;
 let evalDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let scrollDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let autoNextTimer: ReturnType<typeof setTimeout> | null = null;
 let hudToastHost: HTMLElement | null = null;
 let hudToastTextEl: HTMLElement | null = null;
 let hudToastTimer: ReturnType<typeof setTimeout> | null = null;
+let programmaticActionActive = false;
+let autoNextTriggeredOnPage = false;
+let autoNextCanceledByUser = false;
 
 const resolvedBlocks = new Map<string, ResolvedBlockRecord>();
 const stateHashToSig = new Map<string, string>();
@@ -123,6 +135,8 @@ const inFlightSignatures = new Set<string>();
 const harvestedReviewHashes = new Set<string>();
 const styledElements = new Set<HTMLElement>();
 const styledInputs = new Set<HTMLInputElement | HTMLTextAreaElement>();
+const appliedAutoClickKeyBySig = new Map<string, string>();
+const userManuallyEditedSigs = new Set<string>();
 
 function sendRuntimeMessage<TResponse>(
   message: RuntimeRequestMessage
@@ -159,10 +173,33 @@ function ensureHighlightStylesheet(): void {
 }
 
 function isElementVisible(el: Element | null): el is HTMLElement {
-  if (!(el instanceof HTMLElement)) {
+  if (!(el instanceof HTMLElement) || !el.isConnected || el.hidden) {
     return false;
   }
-  if (el.hidden || el.closest('[hidden], [inert], template')) {
+  const maybeCheckVis = (
+    el as HTMLElement & {
+      checkVisibility?: (opts?: {
+        checkOpacity?: boolean;
+        checkVisibilityCSS?: boolean;
+      }) => boolean;
+    }
+  ).checkVisibility;
+  if (typeof maybeCheckVis === 'function') {
+    if (
+      !maybeCheckVis.call(el, {
+        checkOpacity: true,
+        checkVisibilityCSS: true,
+      })
+    ) {
+      return false;
+    }
+    return (
+      el.offsetWidth > 2 ||
+      el.offsetHeight > 2 ||
+      el.getClientRects().length > 0
+    );
+  }
+  if (el.closest('[hidden], [inert], template')) {
     return false;
   }
   const style = window.getComputedStyle(el);
@@ -436,6 +473,7 @@ function buildBlockRecord(
   questionText: string,
   options: string[],
   optionElements: HTMLElement[],
+  optionControls: HTMLElement[],
   multiSelect: boolean,
   questionKind: QuestionKind,
   blankInputs: Array<HTMLInputElement | HTMLTextAreaElement>,
@@ -477,6 +515,7 @@ function buildBlockRecord(
       questionText: cleanedStem,
       options: [],
       optionElements: [],
+      optionControls: [],
       multiSelect: false,
       questionKind: 'fill_blank',
       blankInputs,
@@ -502,6 +541,8 @@ function buildBlockRecord(
     questionText: cleanedStem,
     options,
     optionElements,
+    optionControls:
+      optionControls.length === options.length ? optionControls : optionElements,
     multiSelect,
     questionKind: 'choice',
     blankInputs: [],
@@ -623,7 +664,7 @@ function extractMoodleBlocks(
         claimedControls.add(inp);
         const row = resolveOptionRowForControl(inp, boundary, choiceInputs);
         optionElements.push(row);
-        options.push(cleanOptionItemText(extractRichMathText(row), false));
+        options.push(cleanOptionItemText(extractRichMathText(row), true));
       }
 
       harvestMoodleReviewVerifiedAnswer(queEl, stem, options);
@@ -633,6 +674,7 @@ function extractMoodleBlocks(
         stem,
         options,
         optionElements,
+        choiceInputs,
         multiSelect,
         'choice',
         [],
@@ -658,6 +700,7 @@ function extractMoodleBlocks(
         stem,
         [],
         [],
+        [],
         false,
         'fill_blank',
         textInputs,
@@ -679,18 +722,22 @@ function extractMoodleBlocks(
     if (selectControls.length >= 1 && selectControls.length <= 10) {
       let addedSelect = false;
       for (const sel of selectControls) {
-        const validOpts = Array.from(sel.options)
+        const validOptionEntries = Array.from(sel.options)
           .filter(
             (opt) =>
               opt.value !== '' &&
               !/^(?:choose|chọn|select)\b/i.test(opt.text.trim())
           )
-          .map((opt) => opt.text.replace(/\s+/g, ' ').trim())
-          .filter((t) => t.length > 0);
+          .map((opt) => ({
+            value: opt.value,
+            label: opt.text.replace(/\s+/g, ' ').trim(),
+          }))
+          .filter((entry) => entry.label.length > 0);
 
-        if (validOpts.length < 2 || validOpts.length > 12) {
+        if (validOptionEntries.length < 2 || validOptionEntries.length > 12) {
           continue;
         }
+        const validOpts = validOptionEntries.map((entry) => entry.label);
         const rowCell = sel.closest('tr')?.querySelector<HTMLElement>('td.text');
         const subPrompt = rowCell ? extractRichMathText(rowCell) : '';
         const fullStem = subPrompt
@@ -702,6 +749,7 @@ function extractMoodleBlocks(
           fullStem,
           validOpts,
           placeholderEls,
+          placeholderEls,
           false,
           'choice',
           [],
@@ -709,6 +757,9 @@ function extractMoodleBlocks(
         );
         if (built) {
           built.selectControl = sel;
+          built.selectOptionValues = validOptionEntries.map(
+            (entry) => entry.value
+          );
           claimedControls.add(sel);
           results.push(built);
           addedSelect = true;
@@ -780,6 +831,7 @@ function extractCanvasBlocks(
         stem,
         options,
         optionElements,
+        controls,
         multiSelect,
         'choice',
         [],
@@ -803,6 +855,7 @@ function extractCanvasBlocks(
       const built = buildBlockRecord(
         qEl,
         stem,
+        [],
         [],
         [],
         false,
@@ -874,6 +927,7 @@ function extractFormsBlocks(
           el.querySelector('[role="checkbox"], input[type="checkbox"]') !== null
       );
       const optionElements: HTMLElement[] = [];
+      const optionControls: HTMLElement[] = [];
       const options: string[] = [];
 
       for (const item of choiceItems) {
@@ -884,7 +938,13 @@ function extractFormsBlocks(
         const row = isGoogleForms
           ? resolveOptionRowForControl(item, card, choiceItems)
           : item;
+        const interactiveCtrl = isGoogleForms
+          ? item
+          : item.querySelector<HTMLElement>(
+              'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'
+            ) ?? item;
         optionElements.push(row);
+        optionControls.push(interactiveCtrl);
         const rawOpt =
           item.getAttribute('data-value') ||
           extractRichMathText(row) ||
@@ -898,6 +958,7 @@ function extractFormsBlocks(
         stem,
         options,
         optionElements,
+        optionControls,
         multiSelect,
         'choice',
         [],
@@ -921,6 +982,7 @@ function extractFormsBlocks(
       const built = buildBlockRecord(
         card,
         stem,
+        [],
         [],
         [],
         false,
@@ -1122,6 +1184,7 @@ function extractGenericControlGroupBlocks(
       located.stem,
       options,
       optionElements,
+      group,
       multiSelect,
       'choice',
       [],
@@ -1172,6 +1235,7 @@ function extractGenericControlGroupBlocks(
       located.stem,
       options,
       optionElements,
+      items,
       multiSelect,
       'choice',
       [],
@@ -1276,6 +1340,7 @@ function extractCustomCardBlocks(
       located.stem,
       options,
       dedupedOptions,
+      dedupedOptions,
       false,
       'choice',
       [],
@@ -1298,15 +1363,38 @@ function extractUniversalQuestionBlocks(
   const claimedControls = new WeakSet<Element>();
   const allBlocks: UniversalQuestionBlock[] = [];
 
-  allBlocks.push(
-    ...extractMoodleBlocks(claimedContainers, claimedControls, allBlocks.length)
+  const moodleBlocks = extractMoodleBlocks(claimedContainers, claimedControls, 0);
+  if (moodleBlocks.length > 0) {
+    allBlocks.push(...moodleBlocks);
+    if (!forceMode) {
+      return allBlocks;
+    }
+  }
+
+  const canvasBlocks = extractCanvasBlocks(
+    claimedContainers,
+    claimedControls,
+    allBlocks.length
   );
-  allBlocks.push(
-    ...extractCanvasBlocks(claimedContainers, claimedControls, allBlocks.length)
+  if (canvasBlocks.length > 0) {
+    allBlocks.push(...canvasBlocks);
+    if (!forceMode) {
+      return allBlocks;
+    }
+  }
+
+  const formsBlocks = extractFormsBlocks(
+    claimedContainers,
+    claimedControls,
+    allBlocks.length
   );
-  allBlocks.push(
-    ...extractFormsBlocks(claimedContainers, claimedControls, allBlocks.length)
-  );
+  if (formsBlocks.length > 0) {
+    allBlocks.push(...formsBlocks);
+    if (!forceMode) {
+      return allBlocks;
+    }
+  }
+
   allBlocks.push(
     ...extractGenericControlGroupBlocks(
       claimedContainers,
@@ -1582,6 +1670,466 @@ function rememberOriginalBoxStyle(el: HTMLElement): void {
   styledElements.add(el);
 }
 
+async function yieldToMainThread(): Promise<void> {
+  const win = window as Window & {
+    scheduler?: { yield?: () => Promise<void> };
+  };
+  if (win.scheduler && typeof win.scheduler.yield === 'function') {
+    await win.scheduler.yield();
+    return;
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+function isReviewOrReadOnlyAttemptPage(container?: HTMLElement): boolean {
+  const pathLower = window.location.pathname.toLowerCase();
+  if (pathLower.includes('/review.php')) {
+    return true;
+  }
+  if (container && container.querySelector('.outcome .rightanswer') !== null) {
+    return true;
+  }
+  return false;
+}
+
+function dispatchSyntheticOptionClick(target: HTMLElement): void {
+  const eventInit: MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+  };
+  if (typeof PointerEvent === 'function') {
+    target.dispatchEvent(
+      new PointerEvent('pointerdown', { ...eventInit, pointerId: 1, isPrimary: true })
+    );
+  }
+  target.dispatchEvent(new MouseEvent('mousedown', eventInit));
+  if (typeof PointerEvent === 'function') {
+    target.dispatchEvent(
+      new PointerEvent('pointerup', { ...eventInit, pointerId: 1, isPrimary: true })
+    );
+  }
+  target.dispatchEvent(new MouseEvent('mouseup', eventInit));
+  target.click();
+}
+
+function isDangerousSubmitOrNavElement(el: HTMLElement | undefined): boolean {
+  if (!el) {
+    return true;
+  }
+  if (
+    el instanceof HTMLAnchorElement &&
+    el.href &&
+    !el.getAttribute('href')?.startsWith('#') &&
+    !el.getAttribute('href')?.toLowerCase().startsWith('javascript:')
+  ) {
+    return true;
+  }
+  const rawLabel = (
+    (el instanceof HTMLInputElement ? el.value : el.textContent) ||
+    el.getAttribute('aria-label') ||
+    ''
+  )
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (
+    rawLabel.length > 0 &&
+    (FINAL_SUBMIT_DANGER_PATTERN.test(rawLabel) ||
+      NAV_BUTTON_TEXT_PATTERN.test(rawLabel))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function setControlCheckedState(
+  ctrl: HTMLElement | undefined,
+  rowEl: HTMLElement | undefined,
+  shouldCheck: boolean
+): void {
+  if (!ctrl || !document.body.contains(ctrl)) {
+    return;
+  }
+
+  if (
+    ctrl instanceof HTMLInputElement &&
+    (ctrl.type === 'radio' || ctrl.type === 'checkbox')
+  ) {
+    if (
+      ctrl.disabled ||
+      ctrl.value === '-1' ||
+      ctrl.closest('.qtype_multichoice_clearchoice')
+    ) {
+      return;
+    }
+    if (ctrl.checked === shouldCheck) {
+      return;
+    }
+    if (!shouldCheck && ctrl.type === 'radio') {
+      return;
+    }
+
+    ctrl.click();
+
+    if (ctrl.checked !== shouldCheck) {
+      const associatedLabel =
+        ctrl.labels?.[0] ??
+        (rowEl instanceof HTMLLabelElement
+          ? rowEl
+          : rowEl?.querySelector<HTMLLabelElement>('label') ?? null);
+      if (associatedLabel && !isDangerousSubmitOrNavElement(associatedLabel)) {
+        associatedLabel.click();
+      }
+    }
+
+    if (ctrl.checked !== shouldCheck) {
+      const checkedSetter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'checked'
+      )?.set;
+      if (checkedSetter) {
+        checkedSetter.call(ctrl, shouldCheck);
+      } else {
+        ctrl.checked = shouldCheck;
+      }
+      ctrl.dispatchEvent(new Event('input', { bubbles: true }));
+      ctrl.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return;
+  }
+
+  const role = (ctrl.getAttribute('role') ?? '').toLowerCase();
+  if (role === 'radio' || role === 'checkbox' || role === 'option') {
+    if (ctrl.getAttribute('aria-disabled') === 'true') {
+      return;
+    }
+    const ariaVal =
+      ctrl.getAttribute('aria-checked') ?? ctrl.getAttribute('aria-selected');
+    const isChecked = ariaVal === 'true';
+    if (isChecked === shouldCheck) {
+      return;
+    }
+    if (!shouldCheck && role === 'radio') {
+      return;
+    }
+    dispatchSyntheticOptionClick(ctrl);
+    return;
+  }
+
+  if (!shouldCheck) {
+    return;
+  }
+  if (
+    ctrl instanceof HTMLButtonElement &&
+    ctrl.type === 'submit' &&
+    !ctrl.hasAttribute('data-option') &&
+    !/option|choice|answer/i.test(ctrl.className)
+  ) {
+    return;
+  }
+  if (isDangerousSubmitOrNavElement(ctrl)) {
+    return;
+  }
+  dispatchSyntheticOptionClick(ctrl);
+}
+
+function isSelectionCurrentlyAppliedInDom(
+  block: UniversalQuestionBlock,
+  resolution: AnswerResolution
+): boolean {
+  if (block.selectControl && document.body.contains(block.selectControl)) {
+    const winIdx = resolution.indices[0];
+    const expectedVal =
+      typeof winIdx === 'number'
+        ? block.selectOptionValues?.[winIdx]
+        : undefined;
+    return Boolean(expectedVal && block.selectControl.value === expectedVal);
+  }
+  if (block.questionKind === 'fill_blank' && resolution.fillText) {
+    const inp = block.blankInputs[0];
+    return Boolean(inp && inp.value.trim() === resolution.fillText.trim());
+  }
+  if (resolution.indices.length === 0) {
+    return false;
+  }
+  return resolution.indices.every((idx) => {
+    const ctrl = block.optionControls[idx];
+    if (ctrl instanceof HTMLInputElement) {
+      return ctrl.checked;
+    }
+    if (ctrl?.hasAttribute('aria-checked')) {
+      return ctrl.getAttribute('aria-checked') === 'true';
+    }
+    return true;
+  });
+}
+
+function applyAutoClickToResolvedBlock(
+  sig: string,
+  block: UniversalQuestionBlock,
+  resolution: AnswerResolution,
+  forceOverride = false
+): void {
+  if (
+    !currentSettings.enabled ||
+    !currentSettings.lmsAutoClickEnabled ||
+    !document.body.contains(block.container) ||
+    isReviewOrReadOnlyAttemptPage(block.container)
+  ) {
+    return;
+  }
+  if (!forceOverride && userManuallyEditedSigs.has(sig)) {
+    return;
+  }
+
+  const selectionKey =
+    block.questionKind === 'fill_blank'
+      ? `fill:${resolution.fillText ?? ''}`
+      : `idx:${[...resolution.indices].sort((a, b) => a - b).join(',')}`;
+
+  if (
+    !forceOverride &&
+    appliedAutoClickKeyBySig.get(sig) === selectionKey &&
+    isSelectionCurrentlyAppliedInDom(block, resolution)
+  ) {
+    return;
+  }
+
+  programmaticActionActive = true;
+  try {
+    if (block.selectControl && document.body.contains(block.selectControl)) {
+      const sel = block.selectControl;
+      const winIdx = resolution.indices[0];
+      const targetVal =
+        typeof winIdx === 'number'
+          ? block.selectOptionValues?.[winIdx]
+          : undefined;
+      if (targetVal !== undefined && !sel.disabled && sel.value !== targetVal) {
+        const valSetter = Object.getOwnPropertyDescriptor(
+          HTMLSelectElement.prototype,
+          'value'
+        )?.set;
+        if (valSetter) {
+          valSetter.call(sel, targetVal);
+        } else {
+          sel.value = targetVal;
+        }
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      appliedAutoClickKeyBySig.set(sig, selectionKey);
+      return;
+    }
+
+    if (block.questionKind === 'fill_blank' && resolution.fillText) {
+      const targetInput = block.blankInputs[0];
+      if (
+        targetInput &&
+        document.body.contains(targetInput) &&
+        !targetInput.disabled &&
+        !targetInput.readOnly &&
+        targetInput.value !== resolution.fillText
+      ) {
+        const proto =
+          targetInput instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const valSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (valSetter) {
+          valSetter.call(targetInput, resolution.fillText);
+        } else {
+          targetInput.value = resolution.fillText;
+        }
+        targetInput.dispatchEvent(
+          new InputEvent('input', {
+            bubbles: true,
+            inputType: 'insertText',
+            data: resolution.fillText,
+          })
+        );
+        targetInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      appliedAutoClickKeyBySig.set(sig, selectionKey);
+      return;
+    }
+
+    if (resolution.indices.length === 0) {
+      return;
+    }
+
+    if (block.multiSelect) {
+      const targetSet = new Set(resolution.indices);
+      for (let i = 0; i < block.optionControls.length; i += 1) {
+        setControlCheckedState(
+          block.optionControls[i],
+          block.optionElements[i],
+          targetSet.has(i)
+        );
+      }
+    } else {
+      const winIdx = resolution.indices[0];
+      if (typeof winIdx === 'number') {
+        setControlCheckedState(
+          block.optionControls[winIdx],
+          block.optionElements[winIdx],
+          true
+        );
+      }
+    }
+
+    appliedAutoClickKeyBySig.set(sig, selectionKey);
+  } finally {
+    programmaticActionActive = false;
+  }
+}
+
+function findSafeNextPageButton(): HTMLElement | null {
+  const navButtons = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      '#mod_quiz_navblock .qnbutton, .othernav .qnbutton, [data-region="quiz-nav-panel"] .qnbutton'
+    )
+  );
+  if (navButtons.length > 0) {
+    const currentIdx = navButtons.findIndex((el) =>
+      el.classList.contains('thispage')
+    );
+    if (currentIdx >= 0 && currentIdx === navButtons.length - 1) {
+      return null;
+    }
+  }
+
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      '#mod_quiz-next-nav, input.mod_quiz-next-nav, button.mod_quiz-next-nav, input[name="next"], button[name="next"], input[type="submit"], button[type="submit"], button:not([type="button"])'
+    )
+  );
+
+  for (const el of candidates) {
+    if (!isElementVisible(el)) {
+      continue;
+    }
+    if (
+      (el instanceof HTMLInputElement || el instanceof HTMLButtonElement) &&
+      el.disabled
+    ) {
+      continue;
+    }
+    const rawLabel = (
+      (el instanceof HTMLInputElement ? el.value : el.textContent) ||
+      el.getAttribute('aria-label') ||
+      ''
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!rawLabel || FINAL_SUBMIT_DANGER_PATTERN.test(rawLabel)) {
+      continue;
+    }
+    if (NEXT_PAGE_SAFE_PATTERN.test(rawLabel)) {
+      return el;
+    }
+  }
+
+  return null;
+}
+
+function cancelScheduledAutoNext(): void {
+  if (autoNextTimer !== null) {
+    clearTimeout(autoNextTimer);
+    autoNextTimer = null;
+  }
+}
+
+function maybeScheduleAutoNextPage(): void {
+  cancelScheduledAutoNext();
+  if (
+    !currentSettings.enabled ||
+    !currentSettings.lmsAutoClickEnabled ||
+    !currentSettings.lmsAutoNextPage ||
+    autoNextTriggeredOnPage ||
+    autoNextCanceledByUser ||
+    isReviewOrReadOnlyAttemptPage() ||
+    inFlightSignatures.size > 0
+  ) {
+    return;
+  }
+
+  const liveBlocks = extractUniversalQuestionBlocks(false);
+  if (liveBlocks.length === 0) {
+    return;
+  }
+
+  const now = Date.now();
+  for (const b of liveBlocks) {
+    const rec = resolvedBlocks.get(b.contentSig);
+    if (!rec) {
+      return;
+    }
+    if (rec.resolution.disputed && now - rec.resolution.timestamp < 4800) {
+      autoNextTimer = setTimeout(() => {
+        autoNextTimer = null;
+        maybeScheduleAutoNextPage();
+      }, 360);
+      return;
+    }
+  }
+
+  const nextBtn = findSafeNextPageButton();
+  if (!nextBtn) {
+    return;
+  }
+
+  autoNextTimer = setTimeout(() => {
+    autoNextTimer = null;
+    if (
+      !currentSettings.enabled ||
+      !currentSettings.lmsAutoClickEnabled ||
+      !currentSettings.lmsAutoNextPage ||
+      autoNextTriggeredOnPage ||
+      autoNextCanceledByUser ||
+      inFlightSignatures.size > 0
+    ) {
+      return;
+    }
+    const confirmedBtn = findSafeNextPageButton();
+    if (confirmedBtn) {
+      autoNextTriggeredOnPage = true;
+      programmaticActionActive = true;
+      try {
+        confirmedBtn.click();
+      } finally {
+        programmaticActionActive = false;
+      }
+    }
+  }, 240);
+}
+
+async function applyAutoClickForAllResolved(
+  forceOverride = false
+): Promise<void> {
+  if (!currentSettings.enabled || !currentSettings.lmsAutoClickEnabled) {
+    return;
+  }
+  const entries = Array.from(resolvedBlocks.entries());
+  let deadline = performance.now() + 50;
+
+  for (const [sig, entry] of entries) {
+    applyAutoClickToResolvedBlock(
+      sig,
+      entry.block,
+      entry.resolution,
+      forceOverride
+    );
+    if (performance.now() >= deadline) {
+      await yieldToMainThread();
+      deadline = performance.now() + 50;
+    }
+  }
+
+  maybeScheduleAutoNextPage();
+}
+
 function renderAllResolvedHighlights(): void {
   clearAllVisualHighlights();
   if (!currentSettings.enabled) {
@@ -1590,6 +2138,7 @@ function renderAllResolvedHighlights(): void {
 
   ensureHighlightStylesheet();
   const isStealth = currentSettings.highlightStyle === 'stealth';
+  const autoClicking = currentSettings.lmsAutoClickEnabled;
   const supportsCustomHighlight =
     typeof CSS !== 'undefined' &&
     'highlights' in CSS &&
@@ -1616,11 +2165,13 @@ function renderAllResolvedHighlights(): void {
           sel.style.outline = GOLD_OUTLINE_CSS;
           sel.style.outlineOffset = '1px';
         }
-        const badge = document.createElement('span');
-        badge.setAttribute('data-khe-lms-badge', isStealth ? 'stealth' : 'gold');
-        badge.setAttribute('aria-hidden', 'true');
-        badge.textContent = isStealth ? `(${winLabel})` : winLabel;
-        sel.insertAdjacentElement('afterend', badge);
+        if (!isStealth || !autoClicking) {
+          const badge = document.createElement('span');
+          badge.setAttribute('data-khe-lms-badge', isStealth ? 'stealth' : 'gold');
+          badge.setAttribute('aria-hidden', 'true');
+          badge.textContent = isStealth ? `(${winLabel})` : winLabel;
+          sel.insertAdjacentElement('afterend', badge);
+        }
       }
       continue;
     }
@@ -1640,24 +2191,28 @@ function renderAllResolvedHighlights(): void {
       styledInputs.add(targetInput);
 
       if (isStealth) {
-        if (!targetInput.value && !targetInput.placeholder) {
-          targetInput.setAttribute('data-khe-orig-ph', '');
-          targetInput.placeholder = resolution.fillText;
-        } else {
-          const badge = document.createElement('span');
-          badge.setAttribute('data-khe-lms-badge', 'stealth');
-          badge.setAttribute('aria-hidden', 'true');
-          badge.textContent = `(${resolution.fillText})`;
-          targetInput.insertAdjacentElement('afterend', badge);
+        if (!autoClicking) {
+          if (!targetInput.value && !targetInput.placeholder) {
+            targetInput.setAttribute('data-khe-orig-ph', '');
+            targetInput.placeholder = resolution.fillText;
+          } else {
+            const badge = document.createElement('span');
+            badge.setAttribute('data-khe-lms-badge', 'stealth');
+            badge.setAttribute('aria-hidden', 'true');
+            badge.textContent = `(${resolution.fillText})`;
+            targetInput.insertAdjacentElement('afterend', badge);
+          }
         }
       } else {
         targetInput.style.outline = GOLD_OUTLINE_CSS;
         targetInput.style.outlineOffset = '1px';
-        const badge = document.createElement('span');
-        badge.setAttribute('data-khe-lms-badge', 'gold');
-        badge.setAttribute('aria-hidden', 'true');
-        badge.textContent = resolution.fillText;
-        targetInput.insertAdjacentElement('afterend', badge);
+        if (!autoClicking) {
+          const badge = document.createElement('span');
+          badge.setAttribute('data-khe-lms-badge', 'gold');
+          badge.setAttribute('aria-hidden', 'true');
+          badge.textContent = resolution.fillText;
+          targetInput.insertAdjacentElement('afterend', badge);
+        }
       }
       continue;
     }
@@ -1669,23 +2224,25 @@ function renderAllResolvedHighlights(): void {
       }
 
       if (isStealth) {
-        if (supportsCustomHighlight) {
-          const nodeRanges = collectTextNodeRanges(targetEl);
-          if (nodeRanges.length > 0) {
-            stealthRanges.push(...nodeRanges);
+        if (!autoClicking) {
+          if (supportsCustomHighlight) {
+            const nodeRanges = collectTextNodeRanges(targetEl);
+            if (nodeRanges.length > 0) {
+              stealthRanges.push(...nodeRanges);
+            } else {
+              rememberOriginalBoxStyle(targetEl);
+              targetEl.style.outline = STEALTH_FALLBACK_OUTLINE;
+              targetEl.style.outlineOffset = '1px';
+            }
           } else {
-            rememberOriginalBoxStyle(targetEl);
-            targetEl.style.outline = STEALTH_FALLBACK_OUTLINE;
-            targetEl.style.outlineOffset = '1px';
-          }
-        } else {
-          const hasText = collectTextNodeRanges(targetEl).length > 0;
-          if (hasText) {
-            wrapElementTextWithStealthMarks(targetEl);
-          } else {
-            rememberOriginalBoxStyle(targetEl);
-            targetEl.style.outline = STEALTH_FALLBACK_OUTLINE;
-            targetEl.style.outlineOffset = '1px';
+            const hasText = collectTextNodeRanges(targetEl).length > 0;
+            if (hasText) {
+              wrapElementTextWithStealthMarks(targetEl);
+            } else {
+              rememberOriginalBoxStyle(targetEl);
+              targetEl.style.outline = STEALTH_FALLBACK_OUTLINE;
+              targetEl.style.outlineOffset = '1px';
+            }
           }
         }
       } else {
@@ -1700,7 +2257,7 @@ function renderAllResolvedHighlights(): void {
     }
   }
 
-  if (isStealth && supportsCustomHighlight && stealthRanges.length > 0) {
+  if (isStealth && !autoClicking && supportsCustomHighlight && stealthRanges.length > 0) {
     CSS.highlights.set(STEALTH_HIGHLIGHT_NAME, new Highlight(...stealthRanges));
   }
 }
@@ -1925,6 +2482,13 @@ async function resolveSingleUniversalBlock(
       resolution: response.resolution,
     });
     renderAllResolvedHighlights();
+    applyAutoClickToResolvedBlock(
+      block.contentSig,
+      block,
+      response.resolution,
+      Boolean(block.forceRefresh)
+    );
+    maybeScheduleAutoNextPage();
     return true;
   }
 
@@ -1989,14 +2553,18 @@ async function resolveChoiceBatchChunk(
               latencyMs: itemRes.latencyMs,
               timestamp: Date.now(),
               multiSelect: matchedBlock.multiSelect,
-              triggerMode: 'highlight_only',
+              triggerMode: currentSettings.lmsAutoClickEnabled
+                ? 'instant_auto_click'
+                : 'highlight_only',
               highlightStyle: currentSettings.highlightStyle,
               voteSummary: itemRes.voteSummary,
+              disputed: Boolean(itemRes.disputed),
             },
           });
         }
       }
       renderAllResolvedHighlights();
+      void applyAutoClickForAllResolved(forceRefresh);
 
       const missedBlocks = chunk.filter((b) => !resolvedHashes.has(b.blockId));
       for (const missed of missedBlocks) {
@@ -2235,6 +2803,9 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
 
   if (forceMode) {
     manualScanActivated = true;
+    autoNextCanceledByUser = false;
+    userManuallyEditedSigs.clear();
+    appliedAutoClickKeyBySig.clear();
     const solvedSelection = await solveSelectedTextIfPresent();
     if (solvedSelection) {
       return { detectedCount: 1, solvedCount: 1 };
@@ -2273,6 +2844,7 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
   }
 
   renderAllResolvedHighlights();
+  void applyAutoClickForAllResolved(forceMode);
 
   if (toDispatch.length > 0) {
     if (forceMode) {
@@ -2280,6 +2852,8 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
     } else {
       void dispatchTurboParallelResolution(toDispatch, pageContext, false);
     }
+  } else {
+    maybeScheduleAutoNextPage();
   }
 
   const solvedOnPage = blocks.filter((b) =>
@@ -2287,8 +2861,11 @@ async function runUniversalPageScan(forceMode: boolean): Promise<ScanSummary> {
   ).length;
 
   if (forceMode && blocks.length > 0) {
+    const modeLabel = currentSettings.lmsAutoClickEnabled
+      ? 'Solved & auto-selected'
+      : 'Highlighted';
     showDiscreteToast(
-      `Highlighted ${solvedOnPage}/${blocks.length} question(s) on page.`
+      `${modeLabel} ${solvedOnPage}/${blocks.length} question(s) on page.`
     );
   }
 
@@ -2435,6 +3012,12 @@ async function handleImagePasteOnExternalPage(
         resolution: res.resolution,
       });
       renderAllResolvedHighlights();
+      applyAutoClickToResolvedBlock(
+        singleBlock.contentSig,
+        singleBlock,
+        res.resolution,
+        true
+      );
     }
     const label =
       res.resolution.questionKind === 'fill_blank' && res.resolution.fillText
@@ -2461,15 +3044,20 @@ function initializeUniversalLmsEngine(): void {
 
   void (async () => {
     currentSettings = await loadSettings();
-    if (currentSettings.enabled) {
-      if (isKnownLmsEnvironment()) {
+    if (!currentSettings.enabled) {
+      return;
+    }
+    if (currentSettings.universalHighlightEnabled) {
+      const summary = await runUniversalPageScan(false);
+      if (summary.detectedCount === 0 && isKnownLmsEnvironment()) {
         void sendRuntimeMessage<{ ok: boolean }>({
           type: 'WARMUP_CONNECTIONS',
         });
       }
-      if (currentSettings.universalHighlightEnabled) {
-        scheduleAutoEvaluation(12);
-      }
+    } else if (isKnownLmsEnvironment()) {
+      void sendRuntimeMessage<{ ok: boolean }>({
+        type: 'WARMUP_CONNECTIONS',
+      });
     }
   })();
 
@@ -2479,19 +3067,36 @@ function initializeUniversalLmsEngine(): void {
     }
     const prevStyle = currentSettings.highlightStyle;
     const prevUniversal = currentSettings.universalHighlightEnabled;
+    const prevAutoClick = currentSettings.lmsAutoClickEnabled;
+    const prevAutoNext = currentSettings.lmsAutoNextPage;
     const next = changes[STORAGE_KEYS.SETTINGS].newValue as EngineSettings;
     currentSettings = next;
 
     if (!next.enabled || (!next.universalHighlightEnabled && !manualScanActivated)) {
+      cancelScheduledAutoNext();
       clearAllVisualHighlights();
       return;
     }
 
-    if (prevStyle !== next.highlightStyle) {
+    if (!next.lmsAutoNextPage) {
+      cancelScheduledAutoNext();
+    }
+
+    if (prevStyle !== next.highlightStyle || prevAutoClick !== next.lmsAutoClickEnabled) {
       renderAllResolvedHighlights();
     }
+    if (!prevAutoClick && next.lmsAutoClickEnabled) {
+      if (resolvedBlocks.size > 0) {
+        void applyAutoClickForAllResolved(false);
+      } else {
+        scheduleAutoEvaluation(10);
+      }
+    } else if (!prevAutoNext && next.lmsAutoNextPage) {
+      autoNextCanceledByUser = false;
+      maybeScheduleAutoNextPage();
+    }
     if (!prevUniversal && next.universalHighlightEnabled) {
-      scheduleAutoEvaluation(100);
+      scheduleAutoEvaluation(20);
     }
   });
 
@@ -2522,6 +3127,15 @@ function initializeUniversalLmsEngine(): void {
           if (existing) {
             existing.resolution = message.resolution;
             renderAllResolvedHighlights();
+            if (!userManuallyEditedSigs.has(sig)) {
+              applyAutoClickToResolvedBlock(
+                sig,
+                existing.block,
+                message.resolution,
+                true
+              );
+            }
+            maybeScheduleAutoNextPage();
           } else {
             const liveBlocks = extractUniversalQuestionBlocks(true);
             const found = liveBlocks.find(
@@ -2533,6 +3147,15 @@ function initializeUniversalLmsEngine(): void {
                 resolution: message.resolution,
               });
               renderAllResolvedHighlights();
+              if (!userManuallyEditedSigs.has(found.contentSig)) {
+                applyAutoClickToResolvedBlock(
+                  found.contentSig,
+                  found,
+                  message.resolution,
+                  true
+                );
+              }
+              maybeScheduleAutoNextPage();
             }
           }
         }
@@ -2547,6 +3170,13 @@ function initializeUniversalLmsEngine(): void {
             resolution: message.resolution,
           });
           renderAllResolvedHighlights();
+          applyAutoClickToResolvedBlock(
+            blocks[0].contentSig,
+            blocks[0],
+            message.resolution,
+            true
+          );
+          maybeScheduleAutoNextPage();
         } else {
           const label =
             message.resolution.questionKind === 'fill_blank' &&
@@ -2569,9 +3199,34 @@ function initializeUniversalLmsEngine(): void {
     }
   );
 
+  document.addEventListener(
+    'change',
+    (event: Event) => {
+      if (programmaticActionActive || !event.isTrusted) {
+        return;
+      }
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      cancelScheduledAutoNext();
+      for (const [sig, rec] of resolvedBlocks.entries()) {
+        if (rec.block.container.contains(target)) {
+          userManuallyEditedSigs.add(sig);
+        }
+      }
+    },
+    true
+  );
+
   window.addEventListener(
     'keydown',
     (event: KeyboardEvent) => {
+      if (event.code === 'Escape') {
+        autoNextCanceledByUser = true;
+        cancelScheduledAutoNext();
+        return;
+      }
       if (event.altKey && event.shiftKey && event.code === 'KeyS') {
         event.preventDefault();
         void runUniversalPageScan(true);
@@ -2601,7 +3256,7 @@ function initializeUniversalLmsEngine(): void {
         if (resolvedBlocks.size > 0 || manualScanActivated) {
           void runUniversalPageScan(false);
         }
-      }, 380);
+      }, 320);
     },
     { passive: true }
   );
@@ -2609,35 +3264,50 @@ function initializeUniversalLmsEngine(): void {
   const observer = new MutationObserver((mutations) => {
     if (!chrome.runtime?.id) {
       observer.disconnect();
+      cancelScheduledAutoNext();
       clearAllVisualHighlights();
       return;
     }
     if (
+      programmaticActionActive ||
       !currentSettings.enabled ||
       (!currentSettings.universalHighlightEnabled && !manualScanActivated)
     ) {
       return;
     }
-    let hasRelevantAddition = false;
+    let hasRelevantQuestionMutation = false;
     for (const m of mutations) {
       if (m.type === 'childList' && m.addedNodes.length > 0) {
         for (const node of Array.from(m.addedNodes)) {
+          if (!(node instanceof HTMLElement)) {
+            continue;
+          }
           if (
-            node instanceof HTMLElement &&
-            !node.hasAttribute('data-khe-lms-badge') &&
-            !node.classList.contains('khe-stealth-mark')
+            node.hasAttribute('data-khe-lms-badge') ||
+            node.classList.contains('khe-stealth-mark') ||
+            node.closest('#quiz-timer, [id*="timer"], .timer')
           ) {
-            hasRelevantAddition = true;
+            continue;
+          }
+          if (
+            node.matches(
+              'div.que, input, select, textarea, [role="radio"], [role="checkbox"], [role="listitem"], [data-automation-id="questionItem"], [class*="question"]'
+            ) ||
+            node.querySelector(
+              'div.que, input[type="radio"], input[type="checkbox"], select, [role="radio"], [role="checkbox"], [data-automation-id="questionItem"]'
+            ) !== null
+          ) {
+            hasRelevantQuestionMutation = true;
             break;
           }
         }
       }
-      if (hasRelevantAddition) {
+      if (hasRelevantQuestionMutation) {
         break;
       }
     }
-    if (hasRelevantAddition) {
-      scheduleAutoEvaluation(320);
+    if (hasRelevantQuestionMutation) {
+      scheduleAutoEvaluation(90);
     }
   });
 

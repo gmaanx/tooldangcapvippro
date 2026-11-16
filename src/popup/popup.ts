@@ -335,6 +335,13 @@ function updateModeSubrowsVisibility(mode: TriggerMode): void {
     mode !== 'smart_human_jitter';
 }
 
+function syncLmsAutoNextDisabledState(autoClickEnabled: boolean): void {
+  const autoNextInput = queryRequired<HTMLInputElement>('#lms-auto-next-page');
+  const autoNextCard = queryRequired<HTMLElement>('#lms-auto-next-card');
+  autoNextInput.disabled = !autoClickEnabled;
+  autoNextCard.dataset.disabled = autoClickEnabled ? 'false' : 'true';
+}
+
 function populateForm(settings: EngineSettings): void {
   queryRequired<HTMLInputElement>('#engine-enabled').checked = settings.enabled;
   queryRequired<HTMLInputElement>('#consensus-mode').checked =
@@ -343,6 +350,12 @@ function populateForm(settings: EngineSettings): void {
     settings.antiFocusLoss !== false;
   queryRequired<HTMLInputElement>('#universal-highlight-enabled').checked =
     settings.universalHighlightEnabled !== false;
+  const lmsAutoClick = settings.lmsAutoClickEnabled !== false;
+  queryRequired<HTMLInputElement>('#lms-auto-click-enabled').checked =
+    lmsAutoClick;
+  queryRequired<HTMLInputElement>('#lms-auto-next-page').checked =
+    Boolean(settings.lmsAutoNextPage);
+  syncLmsAutoNextDisabledState(lmsAutoClick);
   const styleRadio = document.querySelector<HTMLInputElement>(
     `input[name="highlightStyle"][value="${settings.highlightStyle ?? 'gold'}"]`
   );
@@ -386,6 +399,12 @@ function readFormSettings(): EngineSettings {
     queryRequired<HTMLInputElement>('#anti-focus-loss').checked;
   const universalHighlightEnabled = queryRequired<HTMLInputElement>(
     '#universal-highlight-enabled'
+  ).checked;
+  const lmsAutoClickEnabled = queryRequired<HTMLInputElement>(
+    '#lms-auto-click-enabled'
+  ).checked;
+  const lmsAutoNextPage = queryRequired<HTMLInputElement>(
+    '#lms-auto-next-page'
   ).checked;
   const selectedStyleRadio = document.querySelector<HTMLInputElement>(
     'input[name="highlightStyle"]:checked'
@@ -446,6 +465,8 @@ function readFormSettings(): EngineSettings {
     consensusMode,
     antiFocusLoss,
     universalHighlightEnabled,
+    lmsAutoClickEnabled,
+    lmsAutoNextPage,
     highlightStyle,
     pinnedContext: queryRequired<HTMLTextAreaElement>('#pinned-context').value,
     triggerMode,
@@ -475,6 +496,12 @@ async function initializePopup(): Promise<void> {
     queryRequired<HTMLInputElement>('#anti-focus-loss');
   const universalHighlightCheckbox = queryRequired<HTMLInputElement>(
     '#universal-highlight-enabled'
+  );
+  const lmsAutoClickCheckbox = queryRequired<HTMLInputElement>(
+    '#lms-auto-click-enabled'
+  );
+  const lmsAutoNextCheckbox = queryRequired<HTMLInputElement>(
+    '#lms-auto-next-page'
   );
 
   installValidationSync(form);
@@ -560,8 +587,28 @@ async function initializePopup(): Promise<void> {
     });
     showStatus(
       universalHighlightCheckbox.checked
-        ? 'External LMS & Custom Web Highlight-Only enabled.'
+        ? 'External LMS & Custom Web Auto-Scan enabled.'
         : 'External LMS auto-scan paused (Alt+Shift+S manual scan still available).'
+    );
+  });
+
+  lmsAutoClickCheckbox.addEventListener('change', async () => {
+    const enabled = lmsAutoClickCheckbox.checked;
+    syncLmsAutoNextDisabledState(enabled);
+    await saveSettings({ lmsAutoClickEnabled: enabled });
+    showStatus(
+      enabled
+        ? 'LMS Auto-Click / Auto-Fill enabled (never auto-submits exam).'
+        : 'LMS switched to Highlight-Only mode.'
+    );
+  });
+
+  lmsAutoNextCheckbox.addEventListener('change', async () => {
+    await saveSettings({ lmsAutoNextPage: lmsAutoNextCheckbox.checked });
+    showStatus(
+      lmsAutoNextCheckbox.checked
+        ? 'Auto-Advance Next Page enabled (stops safely on final question).'
+        : 'Auto-Advance Next Page disabled.'
     );
   });
 
@@ -613,8 +660,11 @@ async function initializePopup(): Promise<void> {
     if (targetTab?.url && isSupportedQuizUrl(targetTab.url)) {
       showStatus('Kahoot / Wayground engine active on current tab.');
     } else {
+      const actionVerb = lmsAutoClickCheckbox.checked
+        ? 'Solved & auto-selected'
+        : 'Highlighted';
       showStatus(
-        `Highlighted ${scanRes.solvedCount}/${scanRes.detectedCount} question(s) (Highlight-Only).`
+        `${actionVerb} ${scanRes.solvedCount}/${scanRes.detectedCount} question(s).`
       );
     }
   });

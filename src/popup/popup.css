@@ -313,8 +313,13 @@ input.user-invalid-fallback + .error-msg {
 
 .checkbox-card {
   min-block-size: 44px;
-  margin-block-end: 9px;
+  margin-block-end: 7px;
   background-color: var(--bg-subtle);
+}
+
+.checkbox-card[data-disabled="true"] {
+  opacity: 0.52;
+  cursor: not-allowed;
 }
 
 .focus-guard-card {

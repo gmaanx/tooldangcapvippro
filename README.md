@@ -1,6 +1,6 @@
 # KahootHybridEngine
 
-A Manifest V3 Chromium extension (TypeScript + Vite) engineered for real-time quiz question extraction, multi-provider parallel LLM consensus resolution, score-paced execution on **Kahoot** and **Wayground (Quizizz)**, and **strictly Highlight-Only** answer indication across **Universal LMS platforms and custom instructor websites**.
+A Manifest V3 Chromium extension (TypeScript + Vite) engineered for real-time quiz question extraction, multi-provider parallel LLM consensus resolution, score-paced execution on **Kahoot** and **Wayground (Quizizz)**, and high-speed **Auto-Click / Auto-Fill or Highlight-Only** execution across **Universal LMS platforms and custom instructor websites**.
 
 ---
 
@@ -10,7 +10,7 @@ A Manifest V3 Chromium extension (TypeScript + Vite) engineered for real-time qu
 | :--- | :--- | :--- | :--- |
 | **Kahoot** | `kahoot.it`, `play.kahoot.it`, `create.kahoot.it` | Auto-Click / Target Score / Highlight | Single-Choice (`2-4` tiles), Multi-Select (`MSQ + Submit`), Challenge/UUID `0ms` pre-fetch, Host-Only Vision & Clipboard solving, Target Score stealth pacing |
 | **Wayground (Quizizz)** | `wayground.com`, `quizizz.com`, `joinmyquiz.com` *(and subdomains)* | Auto-Click / Auto-Type / Target Score / Highlight | Single-Choice (`2-8` options), Multi-Select (`MSQ + Submit`), Fill-in-the-Blank / Short Text Auto-Type, KaTeX / MathJax formula extraction, Embedded Stem-Image Vision, Redemption `0ms` replay, Anti Focus-Loss (`Test Mode`) |
-| **Universal LMS & Custom Web** | Moodle (`lms.*`), Canvas, Google Forms, Microsoft Forms, Blackboard, Azota, Shub, custom HTTP/HTTPS quiz apps | **Strictly Highlight-Only** *(Zero Auto-Click, Zero Auto-Submit, Zero Debugger)* | Single & Multi-Question pages (`2-12` options), Native Radio/Checkbox & ARIA (`radiogroup`) apps, Short-Answer hints, KaTeX / MathJax / LaTeX `alt` extraction, Moodle Review answer harvesting, **Gold Outline** & **Stealth Mode** (`CSS.highlights`), Selection & Manual Scan (`Alt+Shift+S`) |
+| **Universal LMS & Custom Web** | Moodle (`lms.*`), Canvas, Google Forms, Microsoft Forms, Blackboard, Azota, Shub, custom HTTP/HTTPS quiz apps | **Auto-Click / Auto-Fill + Optional Auto-Next Page** *(or Highlight-Only; Zero Debugger, Never Auto-Submits Final Exam)* | Single & Multi-Question pages (`2-12` options), Native Radio/Checkbox, `<select>` Matching Dropdowns, Short-Answer / Numerical inputs, ARIA (`radiogroup`) apps, KaTeX / MathJax / MathML extraction, Moodle Review harvesting, **Gold Outline** & **Stealth Mode** (`CSS.highlights`), Manual Scan (`Alt+Shift+S`) |
 
 ---
 
@@ -24,7 +24,7 @@ The engine operates as a four-tier resolution pipeline designed to minimize late
 
 2. **Tier 2 — Platform Interceptors, Universal LMS Scanner & Scoped CDP Dispatcher**
    - **Kahoot & Wayground:** Intercepts Kahoot CometD WebSocket frames, installs a `document_start` Wayground focus guard (`Anti Focus-Loss`), computes inverse score-decay delays (`Target Score Pacing`), and dispatches hardware-level mouse clicks (`Input.dispatchMouseEvent`) and text insertion (`Input.insertText`) over Chrome DevTools Protocol (`1.3`).
-   - **Universal LMS & Custom Websites (`universal-lms.ts`):** Runs at `document_end` with automatic course breadcrumb grounding (`pageContext`), pre-warming TLS connections on quiz lobby pages, and dispatching multi-question exams in concurrent super-batches (`6` questions/batch, up to `30` questions simultaneously in `~1.0-1.8s`). Any non-unanimous question automatically triggers a secondary **Surgical Arbiter** pass (`gemini-4-argon` / `gemini-3.8-flash` high-thinking + `gpt-oss-120b` + `qwen3.8-27b`) while enforcing a hard **Highlight-Only** boundary (`chrome.debugger` never attaches outside Kahoot and Wayground).
+   - **Universal LMS & Custom Websites (`universal-lms.ts`):** Runs at `document_end` with C++ `checkVisibility()` zero-reflow platform short-circuiting, automatic course breadcrumb grounding (`pageContext`), navigation-time TLS pre-warming, and a two-stage turbo consensus pipeline (`~0.4-1.0s` Phase-1 fast lock across 3 Groq LPU models + low-thinking Gemini, backed by an asynchronous **Surgical Arbiter** pass using `gemini-4-argon` / high-thinking `gemini-3.8-flash` on any split vote). Supports native DOM **Auto-Click / Auto-Fill** (without attaching `chrome.debugger`) and optional **Auto-Advance Next Page** on paginated quizzes while hard-blocking final exam submission buttons.
 
 3. **Tier 3 — Multi-Provider AI Consensus Engine**
    - Executes concurrent low-latency inference across **Groq**, **Google Gemini**, and **OpenRouter**, spanning distinct model families (`Llama-4`, `Qwen-3`, `Gemini Flash`, `DeepSeek`) for both indexed choices (`0-11`) and exact-string fill-in-the-blank prompts.
@@ -105,7 +105,7 @@ Click **Save Configuration** after entering your keys to persist settings and pr
 
 ### 1. Kahoot & Wayground Execution Modes
 
-Configured under **1. Kahoot & Wayground Execution** in the popup (applies exclusively to Kahoot and Wayground; external websites always enforce Highlight-Only):
+Configured under **1. Kahoot & Wayground Execution** in the popup (controls live speed and score pacing on Kahoot and Wayground):
 
 | Mode | Behavior | Recommended Use Case |
 | :--- | :--- | :--- |
@@ -114,14 +114,17 @@ Configured under **1. Kahoot & Wayground Execution** in the popup (applies exclu
 | `Custom Delay (ms)` | Waits a randomized interval bounded by `Min Delay (ms)` and `Max Delay (ms)` before clicking or typing. | Fixed reaction-time simulation independent of question timer length. |
 | `Highlight Only` | Outlines the correct option(s) without attaching `chrome.debugger` or clicking. | Manual answering across all platforms. |
 
-### 2. Universal LMS & Highlight Visual Styles
+### 2. Universal LMS Execution & Highlight Visual Styles
 
-Configured under **2. Universal LMS & Highlight Style**:
+Configured under **2. Universal LMS & External Execution**:
+
+- **LMS Auto-Click / Auto-Fill Answers:** Automatically selects winning radio buttons, checkboxes, `<select>` matching dropdowns, and short-answer inputs via native DOM setters and synthetic events (zero `chrome.debugger` banner). If the background Surgical Arbiter overturns a disputed question, the selected option updates automatically. Manual edits made by the user are respected, and final exam submission buttons (`Submit all and finish` / `Nop bai`) are strictly blocked.
+- **Auto-Advance Next Page:** Optional toggle for `1-question-per-page` LMS exams. Automatically clicks the `Next page` button once all questions on the current page are verified, pauses if a disputed question is awaiting Arbiter confirmation, cancels immediately on `Escape` or manual input change, and stops cleanly on the final question without submitting the exam.
 
 | Style | Visual Rendering | Recommended Environment |
 | :--- | :--- | :--- |
 | `Gold Outline` | Renders a crisp amber-gold border and subtle background tint around winning choice rows, or a compact answer pill adjacent to short-answer inputs. | Personal study, self-paced online LMS quizzes, and remote sessions. |
-| `Stealth Mode` | Uses the CSS Custom Highlight API (`CSS.highlights` / `::highlight()`) to apply a faint dotted underline directly to text ranges without inserting DOM nodes into choice labels, and suppresses all on-page toast notifications. | Proctored computer labs and lecture halls where high-contrast borders or popups are undesirable. |
+| `Stealth Mode` | When `LMS Auto-Click` is enabled, selects native form controls silently with zero borders, badges, or toasts; when `LMS Auto-Click` is off, uses `CSS.highlights` (`::highlight()`) to apply a faint dotted underline to text ranges. | Proctored computer labs and lecture halls where high-contrast borders or popups are undesirable. |
 
 ### 3. Keyboard Shortcuts
 
@@ -138,11 +141,11 @@ Customizable at `chrome://extensions/shortcuts` (on macOS, `Alt` maps to `Option
 
 ## Operational Notes
 
-### 1. Strict Highlight-Only Isolation on External Websites
+### 1. Zero-Debugger Native Execution & Submission Safety on External LMS
 
-Outside `kahoot.it` and `wayground.com` / `quizizz.com` / `joinmyquiz.com`, the service worker and trusted clicker enforce a hard URL and platform lock:
-- `chrome.debugger` **never** attaches on LMS portals or custom instructor websites, meaning Chrome's top debugging infobar will never appear on those sites.
-- No synthetic clicks, form value mutations, or automatic submissions are ever dispatched on external pages.
+Outside `kahoot.it` and `wayground.com` / `quizizz.com` / `joinmyquiz.com`:
+- `chrome.debugger` **never** attaches on LMS portals or custom instructor websites, meaning Chrome's top debugging infobar never appears on LMS pages even with **LMS Auto-Click** enabled.
+- Final submission controls (`Submit all and finish`, `Finish attempt`, `Nop bai`, `Hoan thanh bai lam`) are hard-blocked across both **LMS Auto-Click** and **Auto-Advance Next Page** so users always retain final review control before turning in an exam.
 
 ### 2. `chrome.debugger` Banner Suppression (Optional, for Kahoot & Wayground Auto-Click)
 
@@ -175,13 +178,13 @@ Chromium restricts each tab to a single active debugger session. Keep the `F12` 
 │   │   ├── ai-racer.ts          # Parallel multi-provider inference & consensus voting (choice + fill-blank)
 │   │   ├── clipboard-solver.ts  # Image and text resolution from system clipboard payloads
 │   │   ├── quiz-cache.ts        # Tier 1 REST pre-fetcher & persistent self-learning LRU bank
-│   │   ├── service-worker.ts    # Background router, highlight-only external lock & scan coordinator
+│   │   ├── service-worker.ts    # Background router, async Arbiter dispatcher & scan coordinator
 │   │   ├── trusted-clicker.ts   # Kahoot/Wayground-scoped CDP debugger clicker & text auto-typer
 │   │   └── vision-solver.ts     # Visible-tab capture, WebP compression & multimodal solver
 │   ├── content/
 │   │   ├── content.ts           # Kahoot/Wayground DOM observer, KaTeX parser & score-paced executor
 │   │   ├── injector.ts          # Kahoot/Wayground MAIN-world WebSocket proxy & focus-loss guard
-│   │   └── universal-lms.ts     # Highlight-only multi-adapter scanner for LMS & custom quiz websites
+│   │   └── universal-lms.ts     # Turbo multi-adapter LMS scanner, native auto-clicker & highlight engine
 │   ├── offscreen/
 │   │   ├── offscreen.html       # Offscreen document host for canvas & clipboard operations
 │   │   └── offscreen.ts         # OffscreenCanvas downscaling and clipboard extraction
@@ -194,7 +197,7 @@ Chromium restricts each tab to a single active debugger session. Keep the `F12` 
 │       ├── normalize.ts         # Hostname matchers, text/blank parsers, FNV-1a hashing & score math
 │       ├── storage.ts           # Persistent storage helpers for chrome.storage.local/session
 │       └── types.ts             # Strict TypeScript interfaces and message contracts
-├── manifest.json                # Chrome Extension Manifest V3 declaration (v1.3.0)
+├── manifest.json                # Chrome Extension Manifest V3 declaration (v1.4.0)
 ├── package.json                 # Build scripts and dependencies
 ├── tsconfig.json                # Strict TypeScript compiler configuration
 └── vite.config.ts               # Multi-entry Vite bundler (Popup, Service Worker, Content IIFEs)

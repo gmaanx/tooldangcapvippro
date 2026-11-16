@@ -34,6 +34,8 @@ export interface EngineSettings {
   consensusMode: ConsensusMode;
   antiFocusLoss: boolean;
   universalHighlightEnabled: boolean;
+  lmsAutoClickEnabled: boolean;
+  lmsAutoNextPage: boolean;
   highlightStyle: HighlightStyle;
   pinnedContext: string;
   triggerMode: TriggerMode;
@@ -118,6 +120,7 @@ export interface AnswerResolution {
   minDelayMs?: number;
   maxDelayMs?: number;
   voteSummary?: string;
+  disputed?: boolean;
 }
 
 export interface SerializedQuizCache {

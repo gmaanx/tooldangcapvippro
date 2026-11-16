@@ -640,7 +640,7 @@ export function buildQuizSystemInstruction(
             '].',
           'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, CHỈ, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options.',
           shuffleRule,
-          'First write a concise 2 to 4 sentence verification evaluating the statements and computing any formula step-by-step.',
+          'First write ONE ultra-concise verification line (under 25 words) checking the key formula or statements.',
           'Then on the VERY LAST LINE output the exact tag <<ANSWER: i,j>> containing ONLY the zero-based integer indices (0 to ' +
             maxIndex +
             ') of ALL correct options separated by commas (for example: <<ANSWER: 0,2>>). Never put option letters inside <<ANSWER: ...>>, only zero-based integers.',
@@ -652,7 +652,7 @@ export function buildQuizSystemInstruction(
             '].',
           'Check for negations (KHÔNG, NGOẠI TRỪ, SAI, CHỈ, NOT, EXCEPT, FALSE), mathematical formulas, superscripts/subscripts, units, numerical calculations, and compound options.',
           shuffleRule,
-          'First write a concise 2 to 4 sentence verification evaluating each candidate option and computing any formula step-by-step.',
+          'First write ONE ultra-concise verification line (under 25 words) checking the key formula or candidate options.',
           'Then on the VERY LAST LINE output the exact tag <<ANSWER: k>> where k is the single best zero-based integer index from 0 to ' +
             maxIndex +
             ' (for example: <<ANSWER: 2>>). Never put option letters inside <<ANSWER: ...>>, only the zero-based integer.',
@@ -725,7 +725,8 @@ export async function runGroqTextCompletionWithFallback(
   signal: AbortSignal,
   preferredModel?: string,
   initialExclusions: Iterable<string> = [],
-  deepAccuracy = false
+  deepAccuracy = false,
+  arbiterProof = false
 ): Promise<number[]> {
   const excluded = new Set<string>(initialExclusions);
   if (deepAccuracy) {
@@ -740,13 +741,17 @@ export async function runGroqTextCompletionWithFallback(
       attempt > 0,
       attempt === 0 ? preferredModel : undefined
     );
-    const maxTokens = deepAccuracy
+    const maxTokens = arbiterProof
       ? isReasoningModel(modelId)
         ? 1100
         : 520
-      : isReasoningModel(modelId)
-        ? 420
-        : 8;
+      : deepAccuracy
+        ? isReasoningModel(modelId)
+          ? 640
+          : 220
+        : isReasoningModel(modelId)
+          ? 420
+          : 8;
 
     const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
       method: 'POST',
@@ -925,9 +930,10 @@ export async function runGeminiTextCompletion(
   multiSelect: boolean,
   apiKey: string,
   signal: AbortSignal,
-  deepAccuracy = false,
+  _deepAccuracy = false,
   imageBase64?: string,
-  imageMimeType?: string
+  imageMimeType?: string,
+  thinkingLevel: 'low' | 'medium' | 'high' = 'low'
 ): Promise<number[]> {
   const inputPayload =
     imageBase64 && imageBase64.length > 0
@@ -955,7 +961,7 @@ export async function runGeminiTextCompletion(
       system_instruction: systemInstruction,
       input: inputPayload,
       generation_config: {
-        thinking_level: deepAccuracy ? 'high' : 'low',
+        thinking_level: thinkingLevel,
         seed: 0,
       },
     }),
@@ -1501,9 +1507,7 @@ export async function raceCustomPromptInference(
         const desiredGroqVoters = deepAccuracy
           ? nonGroqCount >= 2
             ? 2
-            : nonGroqCount === 1
-              ? 2
-              : 3
+            : 3
           : nonGroqCount >= 2
             ? 1
             : 2;
@@ -1790,7 +1794,7 @@ async function runGeminiFillBlankCompletion(
   expectedLength: number | undefined,
   apiKey: string,
   signal: AbortSignal,
-  deepAccuracy = false,
+  _deepAccuracy = false,
   imageBase64?: string,
   imageMimeType?: string
 ): Promise<string> {
@@ -1820,7 +1824,7 @@ async function runGeminiFillBlankCompletion(
       system_instruction: systemInstruction,
       input: inputPayload,
       generation_config: {
-        thinking_level: deepAccuracy ? 'high' : 'low',
+        thinking_level: 'low',
         seed: 0,
       },
     }),
@@ -2394,7 +2398,8 @@ async function runGeminiArbiterCompletion(
     signal,
     true,
     imageBase64,
-    imageMimeType
+    imageMimeType,
+    'high'
   );
   return { indices: flashIndices, usedProModel: false };
 }
@@ -2505,6 +2510,7 @@ export async function runSurgicalArbiterVerification(
             signal,
             modelId,
             siblings,
+            true,
             true
           ),
       });
@@ -2579,7 +2585,7 @@ async function runSingleVoterBatchCall(
         system_instruction: systemInstruction,
         input: userPrompt,
         generation_config: {
-          thinking_level: 'medium',
+          thinking_level: 'low',
           seed: 0,
         },
       }),
@@ -2614,7 +2620,7 @@ async function runSingleVoterBatchCall(
         attempt > 0,
         attempt === 0 ? assignedGroqModel : undefined
       );
-      const maxTokens = isReasoningModel(modelId) ? 2200 : 950;
+      const maxTokens = isReasoningModel(modelId) ? 1500 : 620;
       const response = await fetch(API_ENDPOINTS.GROQ_CHAT_COMPLETIONS, {
         method: 'POST',
         signal,
@@ -2952,9 +2958,9 @@ export async function raceBatchChoiceInference(
               (distinctProviderCount < 2 || settledProviders.size >= 2) &&
               windowTimer === null
             ) {
-              windowTimer = setTimeout(finish, 3400);
+              windowTimer = setTimeout(finish, 1350);
             } else if (settled >= 2 && windowTimer === null) {
-              windowTimer = setTimeout(finish, 5200);
+              windowTimer = setTimeout(finish, 2100);
             }
           } catch {
             if (done) {
@@ -3033,7 +3039,8 @@ export async function raceBatchChoiceInference(
 
 export async function raceParallelInference(
   payload: QuestionPayload,
-  settings: EngineSettings
+  settings: EngineSettings,
+  options?: { deferArbiter?: boolean }
 ): Promise<RaceResult> {
   const startedAt = performance.now();
   const deepAccuracy =
@@ -3084,7 +3091,7 @@ export async function raceParallelInference(
     payload.imageMimeType
   );
 
-  if (deepAccuracy && primaryResult.disputed) {
+  if (deepAccuracy && primaryResult.disputed && !options?.deferArbiter) {
     const arbiterResult = await runSurgicalArbiterVerification(
       {
         questionText: payload.questionText,

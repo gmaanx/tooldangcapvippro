@@ -3,6 +3,7 @@ import {
   extractGamePin,
   extractUuid,
   normalizeQuestionText,
+  stripLeadingOptionPrefix,
 } from '../shared/normalize';
 import {
   clearSerializedQuizCache,
@@ -26,11 +27,69 @@ const MAX_LEARNED_ENTRIES = 1500;
 let activeCachedQuizId = '';
 let isMemoryHydrated = false;
 let isLearnedHydrated = false;
+let learnedPersistTimer: ReturnType<typeof setTimeout> | null = null;
 const questionIndexCache = new Map<string, number[]>();
 const questionChoiceTextCache = new Map<string, string[]>();
 const learnedCache = new Map<string, LearnedQuestionEntry>();
 const inFlightPrefetches = new Map<string, Promise<RuntimeCacheResponse>>();
 const failedQuizTimestamps = new Map<string, number>();
+
+const POSITIONAL_CHOICE_ASCII_PATTERN =
+  /\b(?:ca\s+[a-d]|both\s+[a-d]|[a-d]\s+(?:va|and)\s+[a-d])\b/;
+const GENERIC_META_CHOICE_ASCII_PATTERN =
+  /^(?:tat ca(?: cac (?:cau|y|phuong an)(?: tren)?)? deu (?:dung|sai)|ca hai(?: cau)? deu (?:dung|sai)|all of the above|none of the above|ca [a-d] va [a-d].*|both [a-d] and [a-d].*)$/;
+
+function foldVietnameseAscii(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'd')
+    .toLowerCase();
+}
+
+function normalizeOptionForCache(raw: string): string {
+  return normalizeQuestionText(stripLeadingOptionPrefix(raw));
+}
+
+function isGenericMetaChoice(normOpt: string): boolean {
+  return GENERIC_META_CHOICE_ASCII_PATTERN.test(foldVietnameseAscii(normOpt));
+}
+
+function buildCompositeLearnedKey(
+  normQuestion: string,
+  liveOptions: string[]
+): string {
+  const normOpts = liveOptions
+    .map((opt) => normalizeOptionForCache(opt))
+    .filter((opt) => opt.length > 0);
+  if (normOpts.length < 2) {
+    return normQuestion;
+  }
+  const hasPositional = normOpts.some((opt) =>
+    POSITIONAL_CHOICE_ASCII_PATTERN.test(foldVietnameseAscii(opt))
+  );
+  if (hasPositional) {
+    return `${normQuestion}||ord:${normOpts.join('>')}`;
+  }
+  return `${normQuestion}||set:${[...normOpts].sort().join('|')}`;
+}
+
+function scheduleLearnedCachePersist(): void {
+  if (learnedPersistTimer !== null) {
+    return;
+  }
+  learnedPersistTimer = setTimeout(() => {
+    learnedPersistTimer = null;
+    const payload: SerializedLearnedCache = {
+      entries: Array.from(learnedCache.entries()),
+    };
+    void Promise.all([
+      chrome.storage.local.set({ [STORAGE_KEYS.LEARNED_CACHE_LOCAL]: payload }),
+      updateTelemetry({ learnedQuestionCount: learnedCache.size }),
+    ]);
+  }, 220);
+}
 
 function populateMemoryMaps(serialized: SerializedQuizCache): void {
   questionIndexCache.clear();
@@ -113,20 +172,35 @@ export async function lookupLearnedCache(
     return null;
   }
 
-  const entry = learnedCache.get(normQuestion);
+  const compositeKey = buildCompositeLearnedKey(normQuestion, liveOptions);
+  let entry = learnedCache.get(compositeKey);
+  let usedStemFallback = false;
+
+  if (!entry && compositeKey !== normQuestion) {
+    const legacyEntry = learnedCache.get(normQuestion);
+    if (
+      legacyEntry &&
+      legacyEntry.choiceTexts.length > 0 &&
+      !legacyEntry.choiceTexts.some((t) => isGenericMetaChoice(t))
+    ) {
+      entry = legacyEntry;
+      usedStemFallback = true;
+    }
+  }
+
   if (!entry || (verifiedOnly && !entry.verified)) {
     return null;
   }
 
   const normalizedLiveOptions = liveOptions
-    .map((opt) => normalizeQuestionText(opt))
+    .map((opt) => normalizeOptionForCache(opt))
     .filter((opt) => opt.length > 0);
 
   if (entry.choiceTexts.length > 0 && normalizedLiveOptions.length > 0) {
     const matchedIndices: number[] = [];
     liveOptions.forEach((rawOpt, liveIdx) => {
-      const normOpt = normalizeQuestionText(rawOpt);
-      if (normOpt && entry.choiceTexts.includes(normOpt)) {
+      const normOpt = normalizeOptionForCache(rawOpt);
+      if (normOpt && entry!.choiceTexts.includes(normOpt)) {
         matchedIndices.push(liveIdx);
       }
     });
@@ -136,7 +210,7 @@ export async function lookupLearnedCache(
     return null;
   }
 
-  if (entry.indices.length > 0) {
+  if (!usedStemFallback && entry.indices.length > 0) {
     if (liveOptions.length > 0) {
       const bounded = entry.indices.filter(
         (idx) => idx >= 0 && idx < liveOptions.length
@@ -188,7 +262,12 @@ export async function recordLearnedAnswer(
 
   await ensureLearnedCacheHydrated();
 
-  const existing = learnedCache.get(normQuestion);
+  const primaryKey =
+    cleanFill.length > 0
+      ? normQuestion
+      : buildCompositeLearnedKey(normQuestion, options);
+
+  const existing = learnedCache.get(primaryKey);
   if (existing && existing.verified && !verified) {
     return;
   }
@@ -196,7 +275,7 @@ export async function recordLearnedAnswer(
   const choiceTexts: string[] = [];
   for (const idx of indices) {
     const rawChoice = options[idx] ?? '';
-    const normChoice = normalizeQuestionText(rawChoice);
+    const normChoice = normalizeOptionForCache(rawChoice);
     if (normChoice && !choiceTexts.includes(normChoice)) {
       choiceTexts.push(normChoice);
     }
@@ -207,14 +286,27 @@ export async function recordLearnedAnswer(
   const finalFillText =
     cleanFill.length > 0 ? cleanFill : existing?.fillText;
 
-  learnedCache.delete(normQuestion);
-  learnedCache.set(normQuestion, {
+  const nextEntry: LearnedQuestionEntry = {
     choiceTexts: finalChoiceTexts,
     indices: [...indices],
     fillText: finalFillText,
     verified: verified || Boolean(existing?.verified),
     updatedAt: Date.now(),
-  });
+  };
+
+  learnedCache.delete(primaryKey);
+  learnedCache.set(primaryKey, nextEntry);
+
+  if (
+    primaryKey !== normQuestion &&
+    !finalChoiceTexts.some((t) => isGenericMetaChoice(t))
+  ) {
+    const stemExisting = learnedCache.get(normQuestion);
+    if (!stemExisting || !stemExisting.verified || verified) {
+      learnedCache.delete(normQuestion);
+      learnedCache.set(normQuestion, nextEntry);
+    }
+  }
 
   while (learnedCache.size > MAX_LEARNED_ENTRIES) {
     const oldestKey = learnedCache.keys().next().value;
@@ -225,18 +317,7 @@ export async function recordLearnedAnswer(
     }
   }
 
-  const payload: SerializedLearnedCache = {
-    entries: Array.from(learnedCache.entries()),
-  };
-
-  try {
-    await Promise.all([
-      chrome.storage.local.set({ [STORAGE_KEYS.LEARNED_CACHE_LOCAL]: payload }),
-      updateTelemetry({ learnedQuestionCount: learnedCache.size }),
-    ]);
-  } catch {
-    return;
-  }
+  scheduleLearnedCachePersist();
 }
 
 export function isQuizUuidAlreadyCached(quizIdInput: string): boolean {

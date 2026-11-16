@@ -574,10 +574,11 @@ async function handleBatchQuestionResolution(
                 latencyMs: verified.latencyMs,
                 timestamp: Date.now(),
                 voteSummary: verified.voteSummary,
+                disputed: false,
               },
               settings,
               disputed.item.multiSelect,
-              true
+              !settings.lmsAutoClickEnabled
             );
             await sendContentPushSafe(
               senderTabId,
@@ -612,7 +613,8 @@ async function handleQuestionResolution(
   payload: QuestionPayload,
   senderTabId: number | undefined,
   senderWindowId: number | undefined,
-  senderTabUrl?: string
+  senderTabUrl?: string,
+  senderFrameId?: number
 ): Promise<RuntimeResolveResponse> {
   const settings = await getFastSettings();
   if (!settings.enabled) {
@@ -622,9 +624,9 @@ async function handleQuestionResolution(
     };
   }
 
-  const isExternalHighlightOnly =
+  const isExternalSite =
     payload.platform === 'universal' || !isKahootPlayableUrl(senderTabUrl);
-  const effectivePayload: QuestionPayload = isExternalHighlightOnly
+  const effectivePayload: QuestionPayload = isExternalSite
     ? { ...payload, deepAccuracy: true }
     : payload;
   const requireVerifiedCache = Boolean(effectivePayload.forceRefresh);
@@ -634,10 +636,10 @@ async function handleQuestionResolution(
       base,
       settings,
       payload.multiSelect,
-      isExternalHighlightOnly
+      isExternalSite && !settings.lmsAutoClickEnabled
     );
     if (
-      !isExternalHighlightOnly &&
+      !isExternalSite &&
       settings.triggerMode === 'instant_auto_click' &&
       typeof senderTabId === 'number'
     ) {
@@ -690,7 +692,7 @@ async function handleQuestionResolution(
     }
 
     const canRunVision =
-      !isExternalHighlightOnly &&
+      !isExternalSite &&
       (settings.groqApiKey.length > 0 || settings.geminiApiKey.length > 0);
 
     if (payload.hasQuestionImage && canRunVision) {
@@ -752,7 +754,7 @@ async function handleQuestionResolution(
           return { ok: false, error: 'AI returned an empty fill-blank answer.' };
         }
 
-        if (!isExternalHighlightOnly || raceWinner.tier === 'tier3_consensus') {
+        if (!isExternalSite || raceWinner.tier === 'tier3_consensus') {
           void recordLearnedAnswer(
             effectivePayload.questionText,
             [],
@@ -796,7 +798,7 @@ async function handleQuestionResolution(
       }
     }
 
-    if (isExternalHighlightOnly) {
+    if (isExternalSite) {
       return {
         ok: false,
         error: 'Unable to extract fill-in-the-blank text on external page.',
@@ -982,9 +984,11 @@ async function handleQuestionResolution(
 
   if (hasReadableQuestion && hasReadableOptions) {
     try {
+      const deferArbiter = isExternalSite && typeof senderTabId === 'number';
       const raceWinner = await raceParallelInference(
         effectivePayload,
-        settings
+        settings,
+        { deferArbiter }
       );
       const resolution: AnswerResolution = {
         stateHash: payload.stateHash,
@@ -995,15 +999,80 @@ async function handleQuestionResolution(
         latencyMs: raceWinner.latencyMs,
         timestamp: Date.now(),
         voteSummary: raceWinner.voteSummary,
+        disputed: Boolean(raceWinner.disputed),
       };
 
-      if (!isExternalHighlightOnly || raceWinner.tier === 'tier3_consensus') {
+      if (
+        !raceWinner.disputed &&
+        (!isExternalSite || raceWinner.tier === 'tier3_consensus')
+      ) {
         void recordLearnedAnswer(
           effectivePayload.questionText,
           effectivePayload.options,
           raceWinner.indices,
           false
         );
+      }
+
+      if (
+        deferArbiter &&
+        raceWinner.disputed &&
+        typeof senderTabId === 'number'
+      ) {
+        const optionCount = Math.max(
+          2,
+          effectivePayload.optionCount || effectivePayload.options.length || 4
+        );
+        void (async () => {
+          const verified = await runSurgicalArbiterVerification(
+            {
+              questionText: effectivePayload.questionText,
+              options: effectivePayload.options,
+              multiSelect: effectivePayload.multiSelect,
+              optionCount,
+              imageBase64: effectivePayload.imageBase64,
+              imageMimeType: effectivePayload.imageMimeType,
+            },
+            raceWinner.competingIndices ?? [raceWinner.indices],
+            effectivePayload.pageContext,
+            settings
+          );
+          if (verified && verified.indices.length > 0) {
+            if (verified.tier === 'tier3_consensus') {
+              void recordLearnedAnswer(
+                effectivePayload.questionText,
+                effectivePayload.options,
+                verified.indices,
+                false
+              );
+            }
+            const overrideRes = attachTriggerSettings(
+              {
+                stateHash: payload.stateHash,
+                questionIndex: payload.questionIndex,
+                indices: verified.indices,
+                questionKind: 'choice',
+                tier: verified.tier,
+                latencyMs: verified.latencyMs,
+                timestamp: Date.now(),
+                voteSummary: verified.voteSummary,
+                disputed: false,
+              },
+              settings,
+              payload.multiSelect,
+              !settings.lmsAutoClickEnabled
+            );
+            await sendContentPushSafe(
+              senderTabId,
+              {
+                type: 'APPLY_ARBITER_RESOLUTION',
+                stateHash: payload.stateHash,
+                resolution: overrideRes,
+              },
+              senderFrameId
+            );
+          }
+        })();
       }
 
       const badgeColor =
@@ -1029,7 +1098,7 @@ async function handleQuestionResolution(
     }
   }
 
-  if (isExternalHighlightOnly) {
+  if (isExternalSite) {
     return {
       ok: false,
       error: 'Unable to read question text or choices on external page.',
@@ -1339,14 +1408,25 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
 
   let isSupportedHost = false;
+  let isLmsExamHost = false;
   try {
-    const host = new URL(candidateUrl).hostname.toLowerCase();
+    const parsedUrl = new URL(candidateUrl);
+    const host = parsedUrl.hostname.toLowerCase();
+    const lowerHref = candidateUrl.toLowerCase();
     isSupportedHost = isKahootHostname(host) || isWaygroundHostname(host);
+    isLmsExamHost =
+      lowerHref.includes('/mod/quiz/') ||
+      host.includes('lms.') ||
+      host.startsWith('lms') ||
+      host.includes('moodle') ||
+      host.includes('elearning') ||
+      host.includes('instructure.com');
   } catch {
     isSupportedHost = false;
   }
 
   const shouldWarmup =
+    isLmsExamHost ||
     candidateUrl.includes('play.kahoot.it/v2/lobby') ||
     candidateUrl.includes('kahoot.it/instructions') ||
     candidateUrl.includes('kahoot.it/join') ||
@@ -1362,7 +1442,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       ) {
         void preattachDebuggerToTab(tabId);
       }
-      await warmupProviderConnections(settings);
+      void warmupProviderConnections(settings);
     }
   }
 });
@@ -1494,7 +1574,8 @@ chrome.runtime.onMessage.addListener(
             runtimeMsg.payload,
             sender.tab?.id,
             sender.tab?.windowId,
-            sender.tab?.url
+            sender.tab?.url,
+            sender.frameId
           );
           sendResponse(res);
           break;
@@ -1670,7 +1751,7 @@ chrome.runtime.onMessage.addListener(
           ) {
             void preattachDebuggerToTab(sender.tab.id);
           }
-          await warmupProviderConnections(settings);
+          void warmupProviderConnections(settings);
           sendResponse({ ok: true });
           break;
         }

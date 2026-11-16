@@ -17,6 +17,9 @@ interface VisionLockRecord {
   updatedAt: number;
 }
 
+let telemetryMemoryCache: EngineTelemetry | null = null;
+let telemetryFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
 export async function loadSettings(): Promise<EngineSettings> {
   const stored = await chrome.storage.local.get(STORAGE_KEYS.SETTINGS);
   const raw = stored[STORAGE_KEYS.SETTINGS] as Partial<EngineSettings> | undefined;
@@ -63,6 +66,14 @@ export async function loadSettings(): Promise<EngineSettings> {
       typeof raw.universalHighlightEnabled === 'boolean'
         ? raw.universalHighlightEnabled
         : DEFAULT_SETTINGS.universalHighlightEnabled,
+    lmsAutoClickEnabled:
+      typeof raw.lmsAutoClickEnabled === 'boolean'
+        ? raw.lmsAutoClickEnabled
+        : DEFAULT_SETTINGS.lmsAutoClickEnabled,
+    lmsAutoNextPage:
+      typeof raw.lmsAutoNextPage === 'boolean'
+        ? raw.lmsAutoNextPage
+        : DEFAULT_SETTINGS.lmsAutoNextPage,
     highlightStyle:
       raw.highlightStyle === 'gold' || raw.highlightStyle === 'stealth'
         ? raw.highlightStyle
@@ -104,23 +115,39 @@ export async function saveSettings(
 }
 
 export async function loadTelemetry(): Promise<EngineTelemetry> {
+  if (telemetryMemoryCache) {
+    return { ...telemetryMemoryCache };
+  }
   const stored = await chrome.storage.local.get(STORAGE_KEYS.TELEMETRY);
   const raw = stored[STORAGE_KEYS.TELEMETRY] as Partial<EngineTelemetry> | undefined;
-  return {
+  telemetryMemoryCache = {
     ...DEFAULT_TELEMETRY,
     ...(raw ?? {}),
   };
+  return { ...telemetryMemoryCache };
 }
 
 export async function updateTelemetry(
   patch: Partial<EngineTelemetry>
 ): Promise<EngineTelemetry> {
-  const current = await loadTelemetry();
+  const current = telemetryMemoryCache ?? (await loadTelemetry());
   const next: EngineTelemetry = {
     ...current,
     ...patch,
   };
-  await chrome.storage.local.set({ [STORAGE_KEYS.TELEMETRY]: next });
+  telemetryMemoryCache = next;
+
+  if (telemetryFlushTimer === null) {
+    telemetryFlushTimer = setTimeout(() => {
+      telemetryFlushTimer = null;
+      if (telemetryMemoryCache) {
+        void chrome.storage.local.set({
+          [STORAGE_KEYS.TELEMETRY]: telemetryMemoryCache,
+        });
+      }
+    }, 180);
+  }
+
   return next;
 }
 

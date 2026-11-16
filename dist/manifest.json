@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "KahootHybridEngine",
-  "version": "1.3.0",
-  "description": "Real-time Multi-AI consensus engine for Kahoot, Wayground (Quizizz), and Highlight-Only Universal LMS & custom quizzes.",
+  "version": "1.4.0",
+  "description": "Real-time Multi-AI consensus engine for Kahoot, Wayground (Quizizz), and Universal LMS & custom quizzes with Auto-Click and Highlight modes.",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",

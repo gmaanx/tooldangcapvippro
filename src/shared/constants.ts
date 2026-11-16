@@ -24,6 +24,8 @@ export const DEFAULT_SETTINGS: EngineSettings = {
   consensusMode: 'consensus_vote',
   antiFocusLoss: true,
   universalHighlightEnabled: true,
+  lmsAutoClickEnabled: true,
+  lmsAutoNextPage: false,
   highlightStyle: 'gold',
   pinnedContext: '',
   triggerMode: 'instant_auto_click',
@@ -152,9 +154,9 @@ export const HIGHLIGHT_OUTLINE_CSS = '2px solid rgba(255, 215, 0, 0.85)' as cons
 export const WARMUP_COOLDOWN_MS = 22_000;
 export const VISION_LOCK_TTL_MS = 4_500;
 export const INFERENCE_TIMEOUT_MS = 3_600;
-export const DEEP_INFERENCE_TIMEOUT_MS = 14_000;
+export const DEEP_INFERENCE_TIMEOUT_MS = 9_500;
 export const CONSENSUS_DECISION_WINDOW_MS = 900;
-export const DEEP_CONSENSUS_WINDOW_MS = 5_500;
+export const DEEP_CONSENSUS_WINDOW_MS = 1_650;
 export const BATCH_CHUNK_SIZE = 6;
 export const MAX_PARALLEL_BATCH_CHUNKS = 5;
 export const DEFAULT_QUESTION_TIMER_MS = 20_000;
